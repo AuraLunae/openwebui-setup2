@@ -1,0 +1,19 @@
+{
+  "model": "qwen3:8b",
+  "messages": [{"role": "user", "content": "今日の東京の天気は？検索して調べてください。"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "search_web",
+      "description": "Web検索を実行します",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "description": "検索キーワード"}
+        },
+        "required": ["query"]
+      }
+    }
+  }],
+  "stream": false
+}
