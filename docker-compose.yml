@@ -1,15 +1,12 @@
 # ==============================================================
-# Open WebUI + SearXNG ローカル構築（Windows / RTX 4050 向け）
+# Open WebUI + SearXNG + Browserless ローカル構築
 #
 # 構成:
 #   - 生成モデル : Qwen3 8B (Ollama経由 / ホストOS側で実行)
 #   - Embedding  : Ruri base (Ollama経由)
 #   - リランカー : 日本語 CrossEncoder (Open WebUI内部で実行)
-#   - Web検索    : SearXNG (同一Composeネットワーク内のコンテナ)
-#
-# 事前にホストOS側で実行しておくこと:
-#   ollama pull qwen3:8b
-#   ollama pull kun432/cl-nagoya-ruri-base
+#   - Web検索    : SearXNG (同一Composeネットワーク内)
+#   - スクレイピング: Browserless (Headless Chrome / 同一Composeネットワーク内)
 #
 # 起動:
 #   docker compose up -d
@@ -22,7 +19,6 @@ services:
     restart: unless-stopped
     environment:
       # --- ログ設定 ---
-      # 問題解決後に不要となった場合は、以下の2行をコメントアウトまたは削除してください
       GLOBAL_LOG_LEVEL: "info"
       SRC_LOG_LEVELS: '{"RAG": "DEBUG", "MAIN": "DEBUG", "OLLAMA": "DEBUG", "TOOLS": "DEBUG", "MODELS": "DEBUG", "WEBHOOK": "WARNING", "AUDIT": "WARNING", "DB": "WARNING", "SOCKET": "WARNING"}'
 
@@ -45,10 +41,10 @@ services:
       RAG_WEB_SEARCH_CONCURRENT_REQUESTS: 10
       ENABLE_RAG_LOCAL_WEB_FETCH: "true"
 
-      # --- SearXNGの接続先（同一Composeネットワーク内のサービス名で指定） ---
+      # --- SearXNGの接続先 ---
       SEARXNG_QUERY_URL: "http://searxng:8080/search?lang=ja&q=<query>"
 
-      # --- Embedding設定（Ruri base / Ollama経由） ---
+      # --- Embedding設定 ---
       RAG_EMBEDDING_ENGINE: "ollama"
       RAG_EMBEDDING_MODEL: "kun432/cl-nagoya-ruri-base:latest"
       RAG_EMBEDDING_BATCH_SIZE: 1
@@ -95,6 +91,7 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - searxng
+      - browserless
 
   searxng:
     container_name: searxng_host
@@ -118,6 +115,15 @@ services:
       options:
         max-size: "1m"
         max-file: "1"
+
+  # --- 追加: カスタムスクリプトが呼び出す Browserless コンテナ ---
+  browserless:
+    container_name: browserless_host
+    image: ghcr.io/browserless/chromium:latest
+    restart: unless-stopped
+    environment:
+      - CONCURRENCY=10
+      - TIMEOUT=10000
 
 volumes:
   open-webui:
