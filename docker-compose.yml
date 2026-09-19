@@ -1,15 +1,20 @@
-# Open WebUI + SearXNG + Browserless + Open Terminal ローカル構築
+---
+# ==============================================================
+# Open WebUI + SearXNG ローカル構築（Windows / RTX 4050 向け）
 #
 # 構成:
-#   - 生成モデル     : Qwen3 8B (Ollama経由 / ホストOS側で実行)
-#   - Embedding      : Ruri base (Ollama経由)
-#   - リランカー     : 日本語 CrossEncoder (Open WebUI内部で実行)
-#   - Web検索        : SearXNG (同一Composeネットワーク内)
-#   - スクレイピング : Browserless (Headless Chrome / 同一Composeネットワーク内)
-#   - 仮想環境/操作  : Open Terminal (同一Composeネットワーク内)
+#   - 生成モデル : Qwen3 8B (Ollama経由 / ホストOS側で実行)
+#   - Embedding  : Ruri base (Ollama経由)
+#   - リランカー : 日本語 CrossEncoder (Open WebUI内部で実行)
+#   - Web検索    : SearXNG (同一Composeネットワーク内のコンテナ)
+#
+# 事前にホストOS側で実行しておくこと:
+#   ollama pull qwen3:8b
+#   ollama pull kun432/cl-nagoya-ruri-base
 #
 # 起動:
 #   docker compose up -d
+# ==============================================================
 
 services:
   openwebui:
@@ -17,14 +22,24 @@ services:
     image: ghcr.io/open-webui/open-webui:main
     restart: unless-stopped
     environment:
-      # --- ログ設定 ---
+      # 問題の切り分けが済んだらこの行は削除してよい（ログが大量に出るため）
       GLOBAL_LOG_LEVEL: "info"
+
+      # ==========================================================
+      # デバッグ用: モジュール別ログレベル
+      # 検索・RAG・Ollama周りだけDEBUGにして、それ以外は静かにする。
+      # 不要になったらこのブロックごと削除、またはコメントアウトでよい。
+      # ==========================================================
       SRC_LOG_LEVELS: '{"RAG": "DEBUG", "MAIN": "DEBUG", "OLLAMA": "DEBUG", "TOOLS": "DEBUG", "MODELS": "DEBUG", "WEBHOOK": "WARNING", "AUDIT": "WARNING", "DB": "WARNING", "SOCKET": "WARNING"}'
 
       # --- ホストOSのOllamaへの接続 ---
       OLLAMA_BASE_URL: "http://host.docker.internal:11434"
 
-      # --- Web検索設定（新名称） ---
+      # ==========================================================
+      # Web検索の有効化【新名称】
+      # ※ 2025年以降のOpen WebUIはこちらを参照する。
+      #    旧名称(RAG_接頭辞)だけだと検索処理が起動しないので必須。
+      # ==========================================================
       ENABLE_WEB_SEARCH: "true"
       WEB_SEARCH_ENGINE: "searxng"
       WEB_SEARCH_RESULT_COUNT: 6
@@ -33,7 +48,7 @@ services:
       ENABLE_WEB_LOADER_SSL_VERIFICATION: "true"
       WEB_LOADER_ENGINE: "safe_web"
 
-      # --- Web検索設定（旧名称 / 互換性維持用） ---
+      # --- 旧名称（古いバージョン向けの後方互換として併記）---
       ENABLE_RAG_WEB_SEARCH: "true"
       RAG_WEB_SEARCH_ENGINE: "searxng"
       RAG_WEB_SEARCH_RESULT_COUNT: 6
@@ -41,23 +56,36 @@ services:
       ENABLE_RAG_LOCAL_WEB_FETCH: "true"
 
       # --- SearXNGの接続先 ---
+      # コンテナ名 searxng で名前解決される（同一Composeネットワーク内）
       SEARXNG_QUERY_URL: "http://searxng:8080/search?lang=ja&q=<query>"
 
-      # --- Embedding設定 ---
-      RAG_EMBEDDING_ENGINE: "ollama"
-      RAG_EMBEDDING_MODEL: "kun432/cl-nagoya-ruri-base:latest"
-      RAG_EMBEDDING_BATCH_SIZE: 1
-      RAG_OLLAMA_BASE_URL: "http://host.docker.internal:11434"
-      CHUNK_SIZE: 500
-      CHUNK_OVERLAP: 50
+      # ==========================================================
+      # Embedding（Ruri v3 / Hugging Faceから直接ロード）
+      # RAG_EMBEDDING_ENGINEをollamaにせず空にしておくと、Open WebUI自身が
+      # sentence-transformers経由でHugging Faceから直接ダウンロードして動く。
+      # Ollamaへの登録は不要。
+      # ==========================================================
+      RAG_EMBEDDING_MODEL: "cl-nagoya/ruri-v3-310m"
+      RAG_EMBEDDING_BATCH_SIZE: 8
 
-      # --- リランカー設定 ---
+      # Ruri v3は最大8192トークンまで対応（v1/v2の512トークンから大幅拡張）。
+      # 記事のベンチマーク（Vecta 2026）に合わせてRecursive 512トークン相当に設定。
+      CHUNK_SIZE: 500
+      CHUNK_OVERLAP: 75
+
+      # ==========================================================
+      # リランカー（Ruri v3 reranker / Hugging Faceから直接ロード）
+      # JQaRAベンチマークでnDCG@10=86.9と、旧SOTA(77.1)を大幅に上回る報告あり。
+      # ==========================================================
       ENABLE_RAG_HYBRID_SEARCH: "true"
-      RAG_RERANKING_MODEL: "hotchpotch/japanese-reranker-cross-encoder-large-v1"
-      RAG_TOP_K: 3
+      RAG_RERANKING_MODEL: "cl-nagoya/ruri-v3-reranker-310m"
+      RAG_TOP_K: 12
+      RAG_TOP_K_RERANKER: 6
       RAG_RELEVANCE_THRESHOLD: 0.0
 
-      # --- 日本語検索クエリ生成プロンプト ---
+      # ==========================================================
+      # 検索クエリを日本語で生成させるプロンプト
+      # ==========================================================
       QUERY_GENERATION_PROMPT_TEMPLATE: |-
         ### Task:
         Analyze the chat history to determine the necessity of generating search queries, in the given language. By default, **prioritize generating 1-3 broad and relevant search queries** unless it is absolutely certain that no additional information is required. The aim is to retrieve comprehensive, updated, and valuable information even with minimal uncertainty. If no search is unequivocally needed, return an empty list.
@@ -90,8 +118,35 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - searxng
-      - browserless
-      - open-terminal
+      - crawl4ai
+      - ruri-embedder
+
+  # --- ページ本文取得・Markdown抽出（旧Browserlessから移行） ---
+  crawl4ai:
+    container_name: crawl4ai_host
+    image: unclecode/crawl4ai:basic
+    restart: unless-stopped
+    environment:
+      # 未認証での踏み台悪用を防ぐため必須。任意の文字列に変更してください。
+      - CRAWL4AI_API_TOKEN=your_secret_crawl4ai_token
+    ports:
+      - "11235:11235"
+    volumes:
+      - /dev/shm:/dev/shm
+    shm_size: "1g"
+
+  # --- カスタムWeb検索ツール専用のRuri v3 embeddingサーバー ---
+  # 初回 `docker compose up` 時にビルドが走り、モデルのダウンロードも
+  # 含めて数分かかる（ネットワーク速度に依存）。
+  ruri-embedder:
+    container_name: ruri_embedder_host
+    build:
+      context: ./ruri-embedder
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ruri-embedder-cache:/root/.cache/huggingface
 
   searxng:
     container_name: searxng_host
@@ -116,30 +171,6 @@ services:
         max-size: "1m"
         max-file: "1"
 
-  # --- カスタムスクリプトが呼び出す Browserless コンテナ ---
-  browserless:
-    container_name: browserless_host
-    image: ghcr.io/browserless/chromium:latest
-    restart: unless-stopped
-    environment:
-      - CONCURRENCY=10
-      - TIMEOUT=10000
-
-  # --- 追加: AI実行用サンドボックス（Open Terminal） ---
-  open-terminal:
-    container_name: open_terminal_host
-    image: ghcr.io/open-webui/open-terminal:main
-    restart: unless-stopped
-    environment:
-      - TERMINAL_API_KEY=your_secret_terminal_key  # ※任意のパスワード文字列に変更してください
-    volumes:
-      - open-terminal-data:/root
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'      # メインPCが重くならないようCPU使用量を制限
-          memory: 2g       # メモリ上限を2GBに制限（必要に応じて調整）
-
 volumes:
   open-webui:
-  open-terminal-data:  # Open Terminal内の作成ファイル保持用
+  ruri-embedder-cache:
