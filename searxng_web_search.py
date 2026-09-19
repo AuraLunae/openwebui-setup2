@@ -1,8 +1,8 @@
 """
-title: SearXNG Search & Browserless Scraper (Ruri Embedding Semantic Chunking)
+title: SearXNG Search & Browserless Scraper (Ruri Embedding Ranked)
 author: user
-description: SearXNGで検索し、Browserlessで本文取得後、Ruri embeddingで意味的なまとまりごとに分割し、質問との関連度が高い部分だけをLLMに渡すツール。日英対応。
-version: 1.9.0
+description: SearXNGで検索し、Browserlessで本文取得後、Recursive Character Splittingで分割、Ruri embeddingで質問との関連度が高いチャンクだけをLLMに渡すツール。日英対応。
+version: 2.0.0
 """
 
 import concurrent.futures
@@ -64,13 +64,67 @@ def _should_skip_url(url: str) -> bool:
     return path.endswith(_SKIP_EXTENSIONS)
 
 
-_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[。！？])|(?<=[.!?])\s+")
+def _recursive_split(text: str, chunk_size: int, overlap: int, separators: list[str]) -> list[str]:
+    """
+    LangChain不使用の自前実装。階層的セパレータ（段落→改行→日本語句読点→
+    英語文末記号→空白→1文字）を順に試し、文脈境界を尊重しつつchunk_sizeに収める。
+    2026年2月のVectaベンチマークでRecursive Character Splitting(512トークン)が
+    全手法中1位（69%）だった結果を踏まえ、Semantic Chunkingより優先して採用する。
+    """
+    if len(text) <= chunk_size:
+        return [text] if text.strip() else []
+
+    if not separators:
+        # どのセパレータでも収まらない場合は文字数で強制分割
+        return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+    sep, rest_separators = separators[0], separators[1:]
+    parts = text.split(sep) if sep else list(text)
+
+    chunks: list[str] = []
+    current = ""
+
+    for part in parts:
+        piece = part + sep if sep else part
+        if len(current) + len(piece) <= chunk_size:
+            current += piece
+        else:
+            if current.strip():
+                chunks.append(current)
+            if len(piece) > chunk_size:
+                # このセパレータでも大きすぎる場合はさらに細かいセパレータで再帰分割
+                chunks.extend(_recursive_split(piece, chunk_size, overlap, rest_separators))
+                current = ""
+            else:
+                current = piece
+
+    if current.strip():
+        chunks.append(current)
+
+    # オーバーラップの付与（前チャンクの末尾をわずかに次チャンクへ含める）
+    if overlap > 0 and len(chunks) > 1:
+        overlapped = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prefix = chunks[i - 1][-overlap:]
+            overlapped.append(prefix + chunks[i])
+        chunks = overlapped
+
+    return [c for c in chunks if c.strip()]
 
 
-def _split_sentences(text: str) -> list[str]:
-    """日本語・英語の文末記号で文単位に分割する。"""
-    raw = _SENTENCE_SPLIT_PATTERN.split(text)
-    return [s.strip() for s in raw if s and s.strip()]
+def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
+    """日本語・英語どちらの文章にも対応した階層的セパレータで分割する。"""
+    if not text.strip():
+        return []
+
+    separators = [
+        "\n\n", "\n",
+        "。", "！", "？",  # 日本語の文末記号
+        ". ", "! ", "? ",  # 英語の文末記号
+        "、", ", ",
+        " ", "",
+    ]
+    return _recursive_split(text, chunk_size, overlap, separators)
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -138,13 +192,13 @@ class Tools:
             default=600,
             description="同一URLの本文取得結果をキャッシュしておく秒数",
         )
-        MAX_SEMANTIC_CHUNK_SIZE: int = Field(
-            default=800,
-            description="意味的なまとまりでグルーピングした際の1チャンクあたりの最大文字数（これを超えたら強制的に区切る）",
+        CHUNK_SIZE: int = Field(
+            default=500,
+            description="1チャンクあたりの目安文字数（ベンチマークで最高精度だったRecursive 512トークン相当）",
         )
-        SEMANTIC_SIMILARITY_THRESHOLD: float = Field(
-            default=0.55,
-            description="隣り合う文の類似度がこの値を下回ったら、話題が変わったとみなして区切る（0〜1、低いほど区切りにくい）",
+        CHUNK_OVERLAP: int = Field(
+            default=75,
+            description="チャンク間のオーバーラップ文字数（目安15%程度、Chroma Researchの推奨レンジ）",
         )
         TOP_K_CHUNKS: int = Field(
             default=8,
@@ -195,48 +249,6 @@ class Tools:
                 _log(f"[Embedding] 失敗 ({type(e).__name__}): {text[:30]!r}...")
                 vectors.append([])
         return vectors
-
-    def _semantic_chunk(self, text: str) -> list[str]:
-        """
-        文単位に分割したうえで、隣り合う文のembedding類似度を見ながらグルーピングする。
-        類似度がSEMANTIC_SIMILARITY_THRESHOLDを下回った箇所＝話題が変わった場所とみなし、
-        そこでチャンクを区切る。文字数固定分割と違い、文の途中や話題の境界で不自然に
-        切れにくい。
-        """
-        sentences = _split_sentences(text)
-        if not sentences:
-            return []
-        if len(sentences) == 1:
-            return sentences
-
-        _log(f"[Semantic Chunking] {len(sentences)}文をembedding計算中")
-        vectors = self._embed(sentences)
-
-        chunks: list[str] = []
-        current_sentences = [sentences[0]]
-        current_len = len(sentences[0])
-
-        for i in range(1, len(sentences)):
-            prev_vec = vectors[i - 1]
-            curr_vec = vectors[i]
-            sim = _cosine_similarity(prev_vec, curr_vec) if prev_vec and curr_vec else 1.0
-
-            exceeds_max_size = current_len + len(sentences[i]) > self.valves.MAX_SEMANTIC_CHUNK_SIZE
-            topic_changed = sim < self.valves.SEMANTIC_SIMILARITY_THRESHOLD
-
-            if topic_changed or exceeds_max_size:
-                chunks.append("".join(current_sentences))
-                current_sentences = [sentences[i]]
-                current_len = len(sentences[i])
-            else:
-                current_sentences.append(sentences[i])
-                current_len += len(sentences[i])
-
-        if current_sentences:
-            chunks.append("".join(current_sentences))
-
-        _log(f"[Semantic Chunking] {len(sentences)}文 → {len(chunks)}チャンクに集約")
-        return chunks
 
     def _rank_chunks_by_relevance(self, query: str, chunks_with_meta: list[dict]) -> list[dict]:
         """
@@ -367,7 +379,7 @@ class Tools:
             # 全ページの本文をチャンク分割
             chunks_with_meta = []
             for page in pages:
-                for chunk in self._semantic_chunk(page["text"]):
+                for chunk in _chunk_text(page["text"], self.valves.CHUNK_SIZE, self.valves.CHUNK_OVERLAP):
                     chunks_with_meta.append({"text": chunk, "title": page["title"], "url": page["url"]})
 
             _log(f"[Phase 3: Embeddingランキング] 総チャンク数: {len(chunks_with_meta)}")
