@@ -6,6 +6,7 @@ version: 4.0.0
 """
 
 import concurrent.futures
+import html as html_lib
 import math
 import re
 import sys
@@ -436,6 +437,33 @@ class Tools:
 
         return ""
 
+    def _http_fallback_text(self, url: str) -> str:
+        """Crawl4AI が使えない場合に、通常の HTTP 取得で本文テキストを拾う。"""
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+        }
+        try:
+            res = self.session.get(url, headers=headers, timeout=15)
+            if res.status_code >= 400:
+                return ""
+            content_type = res.headers.get("Content-Type", "")
+            if "text/html" not in content_type and "application/xhtml" not in content_type and "text/plain" not in content_type:
+                return ""
+            text = res.text
+            text = re.sub(r"(?is)<script.*?</script>", " ", text)
+            text = re.sub(r"(?is)<style.*?</style>", " ", text)
+            text = re.sub(r"(?is)<[^>]+>", "\n", text)
+            text = html_lib.unescape(text)
+            text = re.sub(r"\n{3,}", "\n\n", text)
+            text = re.sub(r"[ \t]+", " ", text)
+            text = re.sub(r"\n +", "\n", text)
+            text = text.strip()
+            return text
+        except Exception:
+            _log(f"[Phase 3: 本文取得] HTTPフォールバック取得失敗: {url}")
+            return ""
+
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
         title = item.get("title", "(タイトルなし)")
         url = item.get("url", "")
@@ -463,7 +491,7 @@ class Tools:
                 "ttl": 3600,
             }
 
-            task_id = None
+            markdown = ""
             for endpoint in ("/crawl_sync", "/crawl"):
                 try:
                     res = self.session.post(
@@ -500,11 +528,13 @@ class Tools:
                                 time.sleep(1)
                             if markdown:
                                 break
-                    if endpoint == "/crawl_sync":
                         markdown = ""
                 except Exception:
                     markdown = ""
-                    continue
+
+            if not markdown:
+                _log(f"[Phase 3: 本文取得] Crawl4AIが空/失敗のためHTTPフォールバック: {url}")
+                markdown = self._http_fallback_text(url)
 
             if not markdown:
                 _log(f"[Phase 3: 本文取得] Markdownが空でした: {url}")
