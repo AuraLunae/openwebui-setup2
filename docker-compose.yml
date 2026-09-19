@@ -118,13 +118,16 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - searxng
+      - crawl4ai
       - ruri-embedder
 
   # --- ページ本文取得・Markdown抽出（旧Browserlessから移行） ---
   crawl4ai:
     container_name: crawl4ai_host
-    profiles: ["browser"]
-    image: unclecode/crawl4ai:basic
+    # 注意: :basic や :latest は 0.9.1 のブラウザ起動バグ(Issue #2064)を踏む可能性があるため
+    # 0.9.0 に固定する。0.9.0未満はCVE-2026-57572（未認証RCE）の対象なので、
+    # それより古いバージョンには絶対に戻さないこと。
+    image: unclecode/crawl4ai:0.9.0
     restart: unless-stopped
     environment:
       # 未認証での踏み台悪用を防ぐため必須。任意の文字列に変更してください。

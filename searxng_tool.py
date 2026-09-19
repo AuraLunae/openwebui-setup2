@@ -6,7 +6,6 @@ version: 4.0.0
 """
 
 import concurrent.futures
-import html as html_lib
 import math
 import re
 import sys
@@ -400,84 +399,6 @@ class Tools:
         _log(f"[Phase 1: Web検索] {len(results)} 件のURLを取得しました（重複除去後）")
         return results
 
-    def _extract_markdown_from_crawl4ai_payload(self, payload: dict) -> str:
-        """Crawl4AI の /crawl, /crawl_sync, /task/{id} で返る複数フォーマットを吸収する。"""
-        if not isinstance(payload, dict):
-            return ""
-
-        candidates = []
-        for key in ("results", "result"):
-            value = payload.get(key)
-            if value is not None:
-                candidates.append(value)
-        if not candidates:
-            candidates.append(payload)
-
-        for item in candidates:
-            if isinstance(item, list):
-                for entry in item:
-                    if isinstance(entry, dict):
-                        markdown = entry.get("markdown")
-                        if isinstance(markdown, dict):
-                            markdown = markdown.get("fit_markdown") or markdown.get("raw_markdown", "")
-                        if markdown:
-                            return markdown
-                        if entry.get("text"):
-                            return str(entry["text"])
-            elif isinstance(item, dict):
-                markdown = item.get("markdown")
-                if isinstance(markdown, dict):
-                    markdown = markdown.get("fit_markdown") or markdown.get("raw_markdown", "")
-                if markdown:
-                    return markdown
-                if item.get("text"):
-                    return str(item["text"])
-                if item.get("content"):
-                    return str(item["content"])
-
-        return ""
-
-    def _http_fallback_text(self, url: str) -> str:
-        """Crawl4AI が使えない場合に、通常の HTTP 取得で本文テキストを拾う。"""
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36",
-            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
-        }
-        try:
-            res = self.session.get(url, headers=headers, timeout=15)
-            if res.status_code >= 400:
-                return ""
-            content_type = res.headers.get("Content-Type", "")
-            if "text/html" not in content_type and "application/xhtml" not in content_type and "text/plain" not in content_type:
-                return ""
-            text = res.text
-            text = re.sub(r"(?is)<script.*?</script>", " ", text)
-            text = re.sub(r"(?is)<style.*?</style>", " ", text)
-            text = re.sub(r"(?is)<[^>]+>", "\n", text)
-            text = html_lib.unescape(text)
-            text = re.sub(r"\n{3,}", "\n\n", text)
-            text = re.sub(r"[ \t]+", " ", text)
-            text = re.sub(r"\n +", "\n", text)
-            text = text.strip()
-            return text
-        except Exception:
-            _log(f"[Phase 3: 本文取得] HTTPフォールバック取得失敗: {url}")
-            return ""
-
-    def _build_crawl4ai_crawler_params(self) -> dict:
-        """Docker/CI 環境で Playwright が閉じられる問題を避けるため、安全な Chromium 引数を明示的に渡す。"""
-        return {
-            "browser_type": "chromium",
-            "headless": True,
-            "extra_args": [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-setuid-sandbox",
-                "--disable-software-rasterizer",
-            ],
-        }
-
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
         title = item.get("title", "(タイトルなし)")
         url = item.get("url", "")
@@ -497,59 +418,21 @@ class Tools:
 
         try:
             _log(f"[Phase 3: 本文取得] Crawl4AIへリクエスト: {url}")
-            payload = {
-                "urls": [url],
-                "js_code": [],
-                "wait_for": "networkidle",
-                "priority": 5,
-                "ttl": 3600,
-                "crawler_params": self._build_crawl4ai_crawler_params(),
-            }
+            res = self.session.post(
+                f"{self.valves.CRAWL4AI_URL}/crawl",
+                json={"urls": [url]},
+                headers=headers,
+                timeout=self.valves.SCRAPE_TIMEOUT,
+            )
+            res.raise_for_status()
+            data = res.json()
 
-            markdown = ""
-            for endpoint in ("/crawl_sync", "/crawl"):
-                try:
-                    res = self.session.post(
-                        f"{self.valves.CRAWL4AI_URL}{endpoint}",
-                        json=payload,
-                        headers=headers,
-                        timeout=self.valves.SCRAPE_TIMEOUT,
-                    )
-                    res.raise_for_status()
-                    data = res.json()
-                    if endpoint == "/crawl_sync":
-                        markdown = self._extract_markdown_from_crawl4ai_payload(data)
-                        if markdown:
-                            break
-                    else:
-                        task_id = data.get("task_id")
-                        if task_id:
-                            deadline = time.time() + self.valves.SCRAPE_TIMEOUT
-                            while time.time() < deadline:
-                                status_res = self.session.get(
-                                    f"{self.valves.CRAWL4AI_URL}/task/{task_id}",
-                                    headers=headers,
-                                    timeout=10,
-                                )
-                                status_res.raise_for_status()
-                                status_data = status_res.json()
-                                status = status_data.get("status")
-                                if status == "completed":
-                                    markdown = self._extract_markdown_from_crawl4ai_payload(status_data)
-                                    if markdown:
-                                        break
-                                elif status == "failed":
-                                    raise RuntimeError(status_data.get("error", "Crawl4AI task failed"))
-                                time.sleep(1)
-                            if markdown:
-                                break
-                        markdown = ""
-                except Exception:
-                    markdown = ""
+            results = data.get("results", [data])
+            page_result = results[0] if results else {}
 
-            if not markdown:
-                _log(f"[Phase 3: 本文取得] Crawl4AIが空/失敗のためHTTPフォールバック: {url}")
-                markdown = self._http_fallback_text(url)
+            markdown = page_result.get("markdown", "")
+            if isinstance(markdown, dict):
+                markdown = markdown.get("fit_markdown") or markdown.get("raw_markdown", "")
 
             if not markdown:
                 _log(f"[Phase 3: 本文取得] Markdownが空でした: {url}")
