@@ -1,8 +1,8 @@
 """
-title: SearXNG Search & Browserless Scraper (Ruri Embedding Ranked)
+title: SearXNG Search & Browserless Scraper (Ruri Embedding Semantic Chunking)
 author: user
-description: SearXNGで検索し、Browserlessで本文取得後、Ruri embeddingで質問との関連度が高いチャンクだけをLLMに渡すツール。
-version: 1.6.0
+description: SearXNGで検索し、Browserlessで本文取得後、Ruri embeddingで意味的なまとまりごとに分割し、質問との関連度が高い部分だけをLLMに渡すツール。日英対応。
+version: 1.9.0
 """
 
 import concurrent.futures
@@ -64,20 +64,13 @@ def _should_skip_url(url: str) -> bool:
     return path.endswith(_SKIP_EXTENSIONS)
 
 
-def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-    """RAG_CHUNK_SIZE/CHUNK_OVERLAPと同じ考え方で文字数ベースに分割する。"""
-    if len(text) <= chunk_size:
-        return [text] if text else []
+_SENTENCE_SPLIT_PATTERN = re.compile(r"(?<=[。！？])|(?<=[.!?])\s+")
 
-    chunks = []
-    step = max(chunk_size - overlap, 1)
-    for i in range(0, len(text), step):
-        chunk = text[i : i + chunk_size]
-        if chunk.strip():
-            chunks.append(chunk)
-        if i + chunk_size >= len(text):
-            break
-    return chunks
+
+def _split_sentences(text: str) -> list[str]:
+    """日本語・英語の文末記号で文単位に分割する。"""
+    raw = _SENTENCE_SPLIT_PATTERN.split(text)
+    return [s.strip() for s in raw if s and s.strip()]
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -145,13 +138,13 @@ class Tools:
             default=600,
             description="同一URLの本文取得結果をキャッシュしておく秒数",
         )
-        CHUNK_SIZE: int = Field(
-            default=500,
-            description="本文をembedding計算用に分割する際の1チャンクあたり文字数（Ruriのトークン上限に合わせる）",
+        MAX_SEMANTIC_CHUNK_SIZE: int = Field(
+            default=800,
+            description="意味的なまとまりでグルーピングした際の1チャンクあたりの最大文字数（これを超えたら強制的に区切る）",
         )
-        CHUNK_OVERLAP: int = Field(
-            default=50,
-            description="チャンク間のオーバーラップ文字数",
+        SEMANTIC_SIMILARITY_THRESHOLD: float = Field(
+            default=0.55,
+            description="隣り合う文の類似度がこの値を下回ったら、話題が変わったとみなして区切る（0〜1、低いほど区切りにくい）",
         )
         TOP_K_CHUNKS: int = Field(
             default=8,
@@ -183,7 +176,9 @@ class Tools:
             _log("初期化エラー:\n" + traceback.format_exc())
             raise
 
+    # =========================================================
     # Embedding（Ruri）関連
+    # =========================================================
     def _embed(self, texts: list[str]) -> list[list[float]]:
         """Ollama経由でRuri embeddingを計算する。1件失敗したら空ベクトルを返す。"""
         vectors = []
@@ -200,6 +195,48 @@ class Tools:
                 _log(f"[Embedding] 失敗 ({type(e).__name__}): {text[:30]!r}...")
                 vectors.append([])
         return vectors
+
+    def _semantic_chunk(self, text: str) -> list[str]:
+        """
+        文単位に分割したうえで、隣り合う文のembedding類似度を見ながらグルーピングする。
+        類似度がSEMANTIC_SIMILARITY_THRESHOLDを下回った箇所＝話題が変わった場所とみなし、
+        そこでチャンクを区切る。文字数固定分割と違い、文の途中や話題の境界で不自然に
+        切れにくい。
+        """
+        sentences = _split_sentences(text)
+        if not sentences:
+            return []
+        if len(sentences) == 1:
+            return sentences
+
+        _log(f"[Semantic Chunking] {len(sentences)}文をembedding計算中")
+        vectors = self._embed(sentences)
+
+        chunks: list[str] = []
+        current_sentences = [sentences[0]]
+        current_len = len(sentences[0])
+
+        for i in range(1, len(sentences)):
+            prev_vec = vectors[i - 1]
+            curr_vec = vectors[i]
+            sim = _cosine_similarity(prev_vec, curr_vec) if prev_vec and curr_vec else 1.0
+
+            exceeds_max_size = current_len + len(sentences[i]) > self.valves.MAX_SEMANTIC_CHUNK_SIZE
+            topic_changed = sim < self.valves.SEMANTIC_SIMILARITY_THRESHOLD
+
+            if topic_changed or exceeds_max_size:
+                chunks.append("".join(current_sentences))
+                current_sentences = [sentences[i]]
+                current_len = len(sentences[i])
+            else:
+                current_sentences.append(sentences[i])
+                current_len += len(sentences[i])
+
+        if current_sentences:
+            chunks.append("".join(current_sentences))
+
+        _log(f"[Semantic Chunking] {len(sentences)}文 → {len(chunks)}チャンクに集約")
+        return chunks
 
     def _rank_chunks_by_relevance(self, query: str, chunks_with_meta: list[dict]) -> list[dict]:
         """
@@ -236,7 +273,9 @@ class Tools:
         )
         return top
 
+    # =========================================================
     # 検索・本文取得
+    # =========================================================
     def _search_searxng(self, query: str) -> list[dict]:
         _log(f"[Phase 1: Web検索] SearXNGにリクエスト送信: query='{query}'")
         params = {"q": query, "format": "json", "lang": "ja"}
@@ -328,7 +367,7 @@ class Tools:
             # 全ページの本文をチャンク分割
             chunks_with_meta = []
             for page in pages:
-                for chunk in _chunk_text(page["text"], self.valves.CHUNK_SIZE, self.valves.CHUNK_OVERLAP):
+                for chunk in self._semantic_chunk(page["text"]):
                     chunks_with_meta.append({"text": chunk, "title": page["title"], "url": page["url"]})
 
             _log(f"[Phase 3: Embeddingランキング] 総チャンク数: {len(chunks_with_meta)}")
