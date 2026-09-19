@@ -464,6 +464,20 @@ class Tools:
             _log(f"[Phase 3: 本文取得] HTTPフォールバック取得失敗: {url}")
             return ""
 
+    def _build_crawl4ai_crawler_params(self) -> dict:
+        """Docker/CI 環境で Playwright が閉じられる問題を避けるため、安全な Chromium 引数を明示的に渡す。"""
+        return {
+            "browser_type": "chromium",
+            "headless": True,
+            "extra_args": [
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-setuid-sandbox",
+                "--disable-software-rasterizer",
+            ],
+        }
+
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
         title = item.get("title", "(タイトルなし)")
         url = item.get("url", "")
@@ -489,6 +503,7 @@ class Tools:
                 "wait_for": "networkidle",
                 "priority": 5,
                 "ttl": 3600,
+                "crawler_params": self._build_crawl4ai_crawler_params(),
             }
 
             markdown = ""
