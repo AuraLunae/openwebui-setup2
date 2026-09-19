@@ -1,16 +1,15 @@
-# ==============================================================
-# Open WebUI + SearXNG + Browserless ローカル構築
+# Open WebUI + SearXNG + Browserless + Open Terminal ローカル構築
 #
 # 構成:
-#   - 生成モデル : Qwen3 8B (Ollama経由 / ホストOS側で実行)
-#   - Embedding  : Ruri base (Ollama経由)
-#   - リランカー : 日本語 CrossEncoder (Open WebUI内部で実行)
-#   - Web検索    : SearXNG (同一Composeネットワーク内)
-#   - スクレイピング: Browserless (Headless Chrome / 同一Composeネットワーク内)
+#   - 生成モデル     : Qwen3 8B (Ollama経由 / ホストOS側で実行)
+#   - Embedding      : Ruri base (Ollama経由)
+#   - リランカー     : 日本語 CrossEncoder (Open WebUI内部で実行)
+#   - Web検索        : SearXNG (同一Composeネットワーク内)
+#   - スクレイピング : Browserless (Headless Chrome / 同一Composeネットワーク内)
+#   - 仮想環境/操作  : Open Terminal (同一Composeネットワーク内)
 #
 # 起動:
 #   docker compose up -d
-# ==============================================================
 
 services:
   openwebui:
@@ -92,6 +91,7 @@ services:
     depends_on:
       - searxng
       - browserless
+      - open-terminal
 
   searxng:
     container_name: searxng_host
@@ -116,7 +116,7 @@ services:
         max-size: "1m"
         max-file: "1"
 
-  # --- 追加: カスタムスクリプトが呼び出す Browserless コンテナ ---
+  # --- カスタムスクリプトが呼び出す Browserless コンテナ ---
   browserless:
     container_name: browserless_host
     image: ghcr.io/browserless/chromium:latest
@@ -125,5 +125,21 @@ services:
       - CONCURRENCY=10
       - TIMEOUT=10000
 
+  # --- 追加: AI実行用サンドボックス（Open Terminal） ---
+  open-terminal:
+    container_name: open_terminal_host
+    image: ghcr.io/open-webui/open-terminal:main
+    restart: unless-stopped
+    environment:
+      - TERMINAL_API_KEY=your_secret_terminal_key  # ※任意のパスワード文字列に変更してください
+    volumes:
+      - open-terminal-data:/root
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'      # メインPCが重くならないようCPU使用量を制限
+          memory: 2g       # メモリ上限を2GBに制限（必要に応じて調整）
+
 volumes:
   open-webui:
+  open-terminal-data:  # Open Terminal内の作成ファイル保持用
