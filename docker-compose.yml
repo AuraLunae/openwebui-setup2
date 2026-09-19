@@ -118,12 +118,12 @@ services:
       - "host.docker.internal:host-gateway"
     depends_on:
       - searxng
-      - crawl4ai
       - ruri-embedder
 
   # --- ページ本文取得・Markdown抽出（旧Browserlessから移行） ---
   crawl4ai:
     container_name: crawl4ai_host
+    profiles: ["browser"]
     image: unclecode/crawl4ai:basic
     restart: unless-stopped
     environment:
