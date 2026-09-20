@@ -2,7 +2,7 @@
 title: SearXNG Search & Crawl4AI Scraper
 author: user
 description: SearXNGでキーワード検索を行い、上位ページの本文を取得・抽出して返すツール。
-version: 4.5.0
+version: 4.6.0
 """
 
 import concurrent.futures
@@ -224,7 +224,7 @@ class Tools:
         )
         CRAWL4AI_URL: str = Field(
             default="http://crawl4ai:11235",
-            description="Crawl4AIのベースURL",
+            description="CRAWL4AIのベースURL",
         )
         CRAWL4AI_API_TOKEN: str = Field(
             default="your_secret_crawl4ai_token",
@@ -268,9 +268,7 @@ class Tools:
         FETCH_TIME_BUDGET_SECONDS: float = Field(
             default=8.0, description="全ページ取得の全体時間予算（秒）"
         )
-        MIN_PAGES_REQUIRED: int = Field(
-            default=1, description="最低保証取得ページ数"
-        )
+        MIN_PAGES_REQUIRED: int = Field(default=1, description="最低保証取得ページ数")
         EMBEDDING_TIMEOUT: int = Field(
             default=15, description="embeddingのタイムアウト（秒）"
         )
@@ -286,9 +284,7 @@ class Tools:
             status_forcelist=[502, 503, 504],
             allowed_methods=["GET", "POST"],
         )
-        adapter = HTTPAdapter(
-            pool_connections=10, pool_maxsize=10, max_retries=retry
-        )
+        adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -409,10 +405,9 @@ class Tools:
             results = data.get("results", [data])
             page_result = results[0] if results else {}
 
-            meta_title = (
-                page_result.get("metadata", {}).get("title")
-                or page_result.get("title")
-            )
+            meta_title = page_result.get("metadata", {}).get(
+                "title"
+            ) or page_result.get("title")
             if meta_title and title in (url, "(タイトルなし)"):
                 title = meta_title
 
@@ -482,6 +477,17 @@ class Tools:
         :return: 検索結果のテキスト
         """
         _log(f"=== search_web 開始: query='{query}' ===")
+
+        # AIを次のアクション（ページ全文精読）へ誘導するためのフッター定義
+        ai_instruction_footer = (
+            "\n\n----------------------------------------\n"
+            "【AIへ次のアクション指示】\n"
+            "上記は検索結果の概要/抜粋情報です。\n"
+            "正確な技術仕様・手順・回答の根拠を詳しく把握して信頼性の高い回答を作成するために、"
+            "上記の中から最も有用と思われるページのURLを選び、**必ず `read_full_webpage(urls=\"<対象のURL>\")` ツールを実行して本文全文を取得・精読してください。**\n"
+            "※検索結果の概要のみで推測して回答を作成することは禁止されています。"
+        )
+
         try:
             search_results = self._search_searxng(query)
             if not search_results:
@@ -528,7 +534,7 @@ class Tools:
                         output_parts.append(
                             f"■ {g['title']}\nURL: {g['url']}\n【関連抜粋】\n{merged_text}\n"
                         )
-                return f"「{query}」のWeb検索結果:\n\n" + "\n".join(output_parts)
+                return f"「{query}」のWeb検索結果:\n\n" + "\n".join(output_parts) + ai_instruction_footer
             else:
                 top_results = search_results[: self.valves.PAGES_TO_FETCH]
                 pages = self._fetch_pages_parallel(top_results)
@@ -536,7 +542,7 @@ class Tools:
                     f"■ {p['title']}\nURL: {p['url']}\n【本文】\n{p['text']}\n"
                     for p in pages
                 ]
-                return f"「{query}」のWeb検索結果:\n\n" + "\n".join(output_parts)
+                return f"「{query}」のWeb検索結果:\n\n" + "\n".join(output_parts) + ai_instruction_footer
 
         except Exception:
             _log("search_web 例外発生:\n" + traceback.format_exc())
