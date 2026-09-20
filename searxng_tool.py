@@ -1,8 +1,8 @@
 """
-title: SearXNG Search & Crawl4AI Scraper
+title: SearXNG Search & Crawl4AI Scraper (with Parallel DuckDuckGo Backup)
 author: user
-description: SearXNGでキーワード検索を行い、上位ページの本文を取得・抽出して返すツール。
-version: 4.6.0
+description: 最初からSearXNGとDuckDuckGo Instant Answer APIの両方に並行リクエストを送り、SearXNGがエラー・結果0件の場合にあらかじめ取得したDuckDuckGoの結果へ切り替えてスクレイピングを行うツール。
+version: 4.8.0
 """
 
 import concurrent.futures
@@ -222,6 +222,14 @@ class Tools:
             default="http://searxng:8080/search",
             description="SearXNGのベースURL",
         )
+        USE_DUCKDUCKGO_BACKUP: bool = Field(
+            default=True,
+            description="最初からDuckDuckGo Instant Answer APIも取得し、SearXNG失敗時に利用するか",
+        )
+        DUCKDUCKGO_API_URL: str = Field(
+            default="https://api.duckduckgo.com/",
+            description="DuckDuckGo Instant Answer APIのベースURL",
+        )
         CRAWL4AI_URL: str = Field(
             default="http://crawl4ai:11235",
             description="CRAWL4AIのベースURL",
@@ -236,7 +244,7 @@ class Tools:
         )
         SEARCH_RESULT_COUNT: int = Field(
             default=8,
-            description="SearXNGから取得する検索結果件数",
+            description="検索結果から取得する件数",
         )
         PAGES_TO_FETCH: int = Field(
             default=4,
@@ -377,6 +385,63 @@ class Tools:
                 break
         return results
 
+    def _search_duckduckgo(self, query: str) -> list[dict]:
+        """DuckDuckGo Instant Answer APIを検索呼び出し"""
+        try:
+            params = {
+                "q": query,
+                "format": "json",
+                "no_html": 1,
+                "skip_disambig": 0,
+            }
+            res = self.session.get(
+                self.valves.DUCKDUCKGO_API_URL, params=params, timeout=8
+            )
+            res.raise_for_status()
+            data = res.json()
+
+            results = []
+
+            # 1. メイン概要情報（AbstractText）
+            abstract_text = data.get("AbstractText", "")
+            abstract_url = data.get("AbstractURL", "")
+            heading = data.get("Heading", query)
+
+            if abstract_text and abstract_url:
+                results.append(
+                    {
+                        "title": heading,
+                        "url": abstract_url,
+                        "content": abstract_text,
+                    }
+                )
+
+            # 2. 関連トピック（RelatedTopics）
+            for topic in data.get("RelatedTopics", []):
+                if "Text" in topic and "FirstURL" in topic:
+                    results.append(
+                        {
+                            "title": topic.get("Text", "")[:40] + "...",
+                            "url": topic.get("FirstURL", ""),
+                            "content": topic.get("Text", ""),
+                        }
+                    )
+                elif "Topics" in topic:
+                    for sub_topic in topic.get("Topics", []):
+                        if "Text" in sub_topic and "FirstURL" in sub_topic:
+                            results.append(
+                                {
+                                    "title": sub_topic.get("Text", "")[:40] + "...",
+                                    "url": sub_topic.get("FirstURL", ""),
+                                    "content": sub_topic.get("Text", ""),
+                                }
+                            )
+
+            return results[: self.valves.SEARCH_RESULT_COUNT]
+        except Exception as e:
+            _log(f"DuckDuckGo API 取得エラー: {e}")
+            return []
+
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
         title = item.get("title") or item.get("url") or "(タイトルなし)"
         url = item.get("url", "")
@@ -478,7 +543,6 @@ class Tools:
         """
         _log(f"=== search_web 開始: query='{query}' ===")
 
-        # AIを次のアクション（ページ全文精読）へ誘導するためのフッター定義
         ai_instruction_footer = (
             "\n\n----------------------------------------\n"
             "【AIへ次のアクション指示】\n"
@@ -489,7 +553,31 @@ class Tools:
         )
 
         try:
-            search_results = self._search_searxng(query)
+            # 1. 最初からSearXNGとDuckDuckGoを並行して同時にリクエスト発行
+            searxng_results = []
+            ddg_results = []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                future_searxng = executor.submit(self._search_searxng, query)
+                
+                if self.valves.USE_DUCKDUCKGO_BACKUP:
+                    future_ddg = executor.submit(self._search_duckduckgo, query)
+                else:
+                    future_ddg = None
+
+                searxng_results = future_searxng.result()
+                if future_ddg:
+                    ddg_results = future_ddg.result()
+
+            # 2. SearXNGの結果を優先使用し、エラーや結果0件の場合は事前に取得したDDGの結果を採用
+            if searxng_results:
+                search_results = searxng_results
+            elif ddg_results:
+                _log(f"SearXNGで結果が得られなかったため、事前取得したDuckDuckGoの結果に切り替えます（{len(ddg_results)}件）")
+                search_results = ddg_results
+            else:
+                search_results = []
+
             if not search_results:
                 return f"「{query}」に関する検索結果が見つかりませんでした。"
 
