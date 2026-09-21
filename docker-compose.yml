@@ -1,12 +1,12 @@
----
 # ==============================================================
-# Open WebUI + SearXNG ローカル構築（Windows / RTX 4050 向け）
+# Open WebUI + SearXNG + Open Terminal ローカル構築（Windows / RTX 4050 向け）
 #
 # 構成:
 #   - 生成モデル : Qwen3 8B (Ollama経由 / ホストOS側で実行)
 #   - Embedding  : Ruri base (Ollama経由)
 #   - リランカー : 日本語 CrossEncoder (Open WebUI内部で実行)
 #   - Web検索    : SearXNG (同一Composeネットワーク内のコンテナ)
+#   - サンドボックス : Open Terminal (Ubuntu 22.04 + API 一体型コンテナ) 【追加】
 #
 # 事前にホストOS側で実行しておくこと:
 #   ollama pull qwen3:8b
@@ -34,6 +34,13 @@ services:
 
       # --- ホストOSのOllamaへの接続 ---
       OLLAMA_BASE_URL: "http://host.docker.internal:11434"
+
+      # ==========================================================
+      # Open Terminal（AI用Ubuntuサンドボックス）の接続設定 【追加】
+      # ==========================================================
+      ENABLE_OPEN_TERMINAL: "true"
+      OPEN_TERMINAL_URL: "http://open-terminal:8000"
+      OPEN_TERMINAL_API_KEY: "your_secret_terminal_key"
 
       # ==========================================================
       # Web検索の有効化【新名称】
@@ -120,6 +127,21 @@ services:
       - searxng
       - crawl4ai
       - ruri-embedder
+      - open-terminal # 【追加】
+
+  # ==========================================================
+  # Open Terminal（UbuntuベースのOS + API通信 一体型コンテナ）【追加】
+  # ==========================================================
+  open-terminal:
+    container_name: open_terminal_host
+    image: ghcr.io/open-webui/open-terminal:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - OPEN_TERMINAL_API_KEY=your_secret_terminal_key
+    volumes:
+      - open-terminal-workspace:/workspace
 
   # --- ページ本文取得・Markdown抽出（旧Browserlessから移行） ---
   crawl4ai:
@@ -177,3 +199,4 @@ services:
 volumes:
   open-webui:
   ruri-embedder-cache:
+  open-terminal-workspace: # 【追加】
