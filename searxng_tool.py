@@ -1,18 +1,19 @@
 """
-title: SearXNG Search & Crawl4AI Scraper
+title: Multi-Search Scraper with Mandatory Wikipedia API Direct Fetch
 author: user
-description: SearXNGでキーワード検索を行い、上位ページの本文を取得・抽出して返すツール。
-version: 4.6.0
+description: SearXNG、Crawl4AI(DDG JSON抽出)、およびWikipedia API直接取得を常時並行実行。ブロックリスクゼロのWikipedia本文を確定で取得・統合する堅牢なWeb検索ツール。
+version: 7.0.0
 """
 
 import concurrent.futures
+import json
 import math
 import re
 import sys
 import time
 import traceback
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 from pydantic import BaseModel, Field
@@ -222,6 +223,18 @@ class Tools:
             default="http://searxng:8080/search",
             description="SearXNGのベースURL",
         )
+        USE_DUCKDUCKGO_BACKUP: bool = Field(
+            default=True,
+            description="Crawl4AI経由でDuckDuckGo検索も並行取得するか",
+        )
+        ALWAYS_FETCH_WIKIPEDIA: bool = Field(
+            default=True,
+            description="Wikipedia APIから直接検索・本文取得を常時（デフォルトで絶対）行うか",
+        )
+        WIKIPEDIA_MAX_RESULTS: int = Field(
+            default=2,
+            description="Wikipediaから常時取得する記事の上限数",
+        )
         CRAWL4AI_URL: str = Field(
             default="http://crawl4ai:11235",
             description="CRAWL4AIのベースURL",
@@ -236,11 +249,11 @@ class Tools:
         )
         SEARCH_RESULT_COUNT: int = Field(
             default=8,
-            description="SearXNGから取得する検索結果件数",
+            description="Web検索結果から取得する件数",
         )
         PAGES_TO_FETCH: int = Field(
-            default=4,
-            description="本文取得する上位ページ数",
+            default=3,
+            description="本文取得する上位Webページ数",
         )
         MAX_CHARS_PER_PAGE: int = Field(
             default=20000,
@@ -345,6 +358,82 @@ class Tools:
             meta for score, meta in scored[: self.valves.TOP_K_CHUNKS] if score > -1.0
         ]
 
+    def _search_wikipedia_api(self, query: str) -> list[dict]:
+        """Wikipedia MediaWiki APIを使ってダイレクト検索し、プレーンテキスト本文を全量取得"""
+        try:
+            _log(f"Wikipedia API 直接取得開始: query='{query}'")
+            headers = {
+                "User-Agent": "MyRAGApp/1.0 (https://example.com; contact@example.com)"
+            }
+            api_url = "https://ja.wikipedia.org/w/api.php"
+
+            # 1. Wikipedia内検索
+            search_params = {
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "format": "json",
+                "srlimit": self.valves.WIKIPEDIA_MAX_RESULTS,
+            }
+            res = self.session.get(
+                api_url, params=search_params, headers=headers, timeout=10
+            )
+            res.raise_for_status()
+            search_items = res.json().get("query", {}).get("search", [])
+
+            if not search_items:
+                _log("Wikipedia API: 該当する記事が見つかりませんでした")
+                return []
+
+            titles = [item["title"] for item in search_items]
+            titles_str = "|".join(titles)
+
+            # 2. 本文（プレーンテキスト）の一括取得
+            fetch_params = {
+                "action": "query",
+                "prop": "extracts",
+                "explaintext": "true",
+                "titles": titles_str,
+                "format": "json",
+                "redirects": 1,
+            }
+            res_pages = self.session.get(
+                api_url, params=fetch_params, headers=headers, timeout=10
+            )
+            res_pages.raise_for_status()
+            pages_data = res_pages.json().get("query", {}).get("pages", {})
+
+            pages = []
+            for page_id, page_info in pages_data.items():
+                if page_id == "-1":
+                    continue
+                title = page_info.get("title", "")
+                url = f"https://ja.wikipedia.org/wiki/{quote(title)}"
+                body_text = page_info.get("extract", "").strip()
+
+                if body_text:
+                    if len(body_text) > self.valves.MAX_CHARS_PER_PAGE:
+                        body_text = (
+                            body_text[: self.valves.MAX_CHARS_PER_PAGE]
+                            + "\n...(以下省略)"
+                        )
+
+                    pages.append(
+                        {
+                            "title": f"[Wikipedia] {title}",
+                            "url": url,
+                            "text": body_text,
+                            "source": "wikipedia",
+                        }
+                    )
+
+            _log(f"Wikipedia API 直接取得成功: {len(pages)}件")
+            return pages
+
+        except Exception as e:
+            _log(f"Wikipedia API 取得エラー: {e}")
+            return []
+
     def _search_searxng_once(self, query: str, attempt: int) -> list[dict]:
         try:
             params = {"q": query, "format": "json", "lang": "ja"}
@@ -376,6 +465,108 @@ class Tools:
             if len(results) >= self.valves.SEARCH_RESULT_COUNT:
                 break
         return results
+
+    def _search_duckduckgo_via_crawl4ai(self, query: str) -> list[dict]:
+        """Crawl4AIのCSS/JSON構造化抽出を使ってDuckDuckGoから直接JSONを取得"""
+        try:
+            ddg_url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+            _log(f"Crawl4AI経由 DuckDuckGo 検索（JSON抽出モード）開始: {ddg_url}")
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            if self.valves.CRAWL4AI_API_TOKEN:
+                headers["Authorization"] = f"Bearer {self.valves.CRAWL4AI_API_TOKEN}"
+
+            extraction_strategy = {
+                "type": "json_css",
+                "params": {
+                    "schema": {
+                        "name": "DuckDuckGo Search Results",
+                        "baseSelector": ".result",
+                        "fields": [
+                            {"name": "title", "selector": ".result__title", "type": "text"},
+                            {"name": "url", "selector": ".result__a", "type": "attribute", "attribute": "href"},
+                            {"name": "snippet", "selector": ".result__snippet", "type": "text"},
+                        ],
+                    }
+                },
+            }
+
+            payload = {
+                "urls": [ddg_url],
+                "extraction_strategy": extraction_strategy,
+            }
+
+            res = self.session.post(
+                f"{self.valves.CRAWL4AI_URL}/crawl",
+                json=payload,
+                headers=headers,
+                timeout=self.valves.SCRAPE_TIMEOUT,
+            )
+            res.raise_for_status()
+            data = res.json()
+
+            results_data = data.get("results", [data])
+            page_result = results_data[0] if results_data else {}
+
+            extracted_raw = page_result.get("extracted_content")
+            if not extracted_raw:
+                return []
+
+            items = (
+                json.loads(extracted_raw)
+                if isinstance(extracted_raw, str)
+                else extracted_raw
+            )
+
+            results = []
+            seen_urls = set()
+
+            for item in items:
+                title = (item.get("title") or "").strip()
+                raw_url = item.get("url") or ""
+                snippet = (item.get("snippet") or "").strip()
+
+                actual_url = raw_url
+                if "duckduckgo.com/l/?" in raw_url or "uddg=" in raw_url:
+                    parsed = urlparse(raw_url)
+                    qs = parse_qs(parsed.query)
+                    if "uddg" in qs:
+                        actual_url = qs["uddg"][0]
+
+                if (
+                    not actual_url.startswith(("http://", "https://"))
+                    or "duckduckgo.com" in actual_url
+                    or actual_url in seen_urls
+                    or _should_skip_url(actual_url)
+                ):
+                    continue
+
+                title_clean = title.replace("\n", " ").strip()
+                snippet_clean = snippet.replace("\n", " ").strip()
+
+                if not title_clean or len(title_clean) < 2:
+                    continue
+
+                seen_urls.add(actual_url)
+                results.append(
+                    {
+                        "title": title_clean,
+                        "url": actual_url,
+                        "content": snippet_clean or title_clean,
+                    }
+                )
+
+                if len(results) >= self.valves.SEARCH_RESULT_COUNT:
+                    break
+
+            _log(f"Crawl4AI(JSON抽出) DuckDuckGo 取得完了: {len(results)}件")
+            return results
+
+        except Exception as e:
+            _log(f"Crawl4AI経由 DuckDuckGo 検索エラー: {e}")
+            return []
 
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
         title = item.get("title") or item.get("url") or "(タイトルなし)"
@@ -471,14 +662,13 @@ class Tools:
 
     def search_web(self, query: str) -> str:
         """
-        指定したキーワードでWeb検索を実行し、最新情報や具体的な情報を収集します。
+        指定したキーワードでWeb検索およびWikipedia本文取得を常時実行し、最新・高精度情報を収集します。
 
         :param query: 検索キーワード
         :return: 検索結果のテキスト
         """
         _log(f"=== search_web 開始: query='{query}' ===")
 
-        # AIを次のアクション（ページ全文精読）へ誘導するためのフッター定義
         ai_instruction_footer = (
             "\n\n----------------------------------------\n"
             "【AIへ次のアクション指示】\n"
@@ -489,15 +679,63 @@ class Tools:
         )
 
         try:
-            search_results = self._search_searxng(query)
-            if not search_results:
+            # 1. SearXNG、Crawl4AI(DDG)、Wikipedia APIを「全て並行」で一元リクエスト
+            searxng_results = []
+            ddg_results = []
+            wiki_pages = []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_searxng = executor.submit(self._search_searxng, query)
+
+                future_ddg = (
+                    executor.submit(self._search_duckduckgo_via_crawl4ai, query)
+                    if self.valves.USE_DUCKDUCKGO_BACKUP
+                    else None
+                )
+
+                # デフォルトで絶対取得するWikipedia処理
+                future_wiki = (
+                    executor.submit(self._search_wikipedia_api, query)
+                    if self.valves.ALWAYS_FETCH_WIKIPEDIA
+                    else None
+                )
+
+                searxng_results = future_searxng.result()
+                if future_ddg:
+                    ddg_results = future_ddg.result()
+                if future_wiki:
+                    wiki_pages = future_wiki.result()
+
+            # 2. 一般Web検索の採用（SearXNG優先、全滅時はDDG採用）
+            if searxng_results:
+                search_results = searxng_results
+            elif ddg_results:
+                _log(
+                    f"SearXNGで結果が得られなかったため、Crawl4AI(DuckDuckGo)の結果を採用（{len(ddg_results)}件）"
+                )
+                search_results = ddg_results
+            else:
+                search_results = []
+
+            web_pages = []
+            if search_results:
+                if self.valves.USE_EMBEDDING_RANKING:
+                    selected = self._select_relevant_pages(query, search_results)
+                    web_pages = self._fetch_pages_parallel(selected)
+                else:
+                    top_results = search_results[: self.valves.PAGES_TO_FETCH]
+                    web_pages = self._fetch_pages_parallel(top_results)
+
+            # 3. 確定取得のWikipedia本文ページと、一般Webページを統合
+            all_pages = wiki_pages + web_pages
+
+            if not all_pages:
                 return f"「{query}」に関する検索結果が見つかりませんでした。"
 
-            if self.valves.USE_EMBEDDING_RANKING:
-                selected = self._select_relevant_pages(query, search_results)
-                pages = self._fetch_pages_parallel(selected)
+            # 4. 出力生成
+            if self.valves.USE_EMBEDDING_RANKING and web_pages:
                 chunks_with_meta = []
-                for page in pages:
+                for page in all_pages:
                     for chunk in _chunk_text_safe(
                         page["text"],
                         self.valves.CHUNK_SIZE,
@@ -516,7 +754,7 @@ class Tools:
                 if not top_chunks:
                     output_parts = [
                         f"■ {p['title']}\nURL: {p['url']}\n【内容】\n{p['text'][:800]}\n"
-                        for p in pages
+                        for p in all_pages
                     ]
                 else:
                     grouped: dict[str, dict] = {}
@@ -534,15 +772,17 @@ class Tools:
                         output_parts.append(
                             f"■ {g['title']}\nURL: {g['url']}\n【関連抜粋】\n{merged_text}\n"
                         )
-                return f"「{query}」のWeb検索結果:\n\n" + "\n".join(output_parts) + ai_instruction_footer
             else:
-                top_results = search_results[: self.valves.PAGES_TO_FETCH]
-                pages = self._fetch_pages_parallel(top_results)
                 output_parts = [
                     f"■ {p['title']}\nURL: {p['url']}\n【本文】\n{p['text']}\n"
-                    for p in pages
+                    for p in all_pages
                 ]
-                return f"「{query}」のWeb検索結果:\n\n" + "\n".join(output_parts) + ai_instruction_footer
+
+            return (
+                f"「{query}」のWeb検索・Wikipedia取得結果:\n\n"
+                + "\n".join(output_parts)
+                + ai_instruction_footer
+            )
 
         except Exception:
             _log("search_web 例外発生:\n" + traceback.format_exc())
