@@ -1,8 +1,8 @@
 """
-title: SearXNG Search & Crawl4AI Scraper
+title: Multi-Search Scraper with Mandatory Wikipedia API Direct Fetch
 author: user
-description: SearXNGでキーワード検索を行い、上位ページの本文を取得・抽出して返すツール。
-version: 4.6.0
+description: SearXNG、Crawl4AI(DDG JSON抽出)、およびWikipedia API直接取得を常時並行実行。ブロックリスクゼロのWikipedia本文を確定で取得・統合する堅牢なWeb検索ツール。
+version: 7.0.0
 """
 
 import concurrent.futures
@@ -223,6 +223,18 @@ class Tools:
             default="http://searxng:8080/search",
             description="SearXNGのベースURL",
         )
+        USE_DUCKDUCKGO_BACKUP: bool = Field(
+            default=True,
+            description="Crawl4AI経由でDuckDuckGo検索も並行取得するか",
+        )
+        ALWAYS_FETCH_WIKIPEDIA: bool = Field(
+            default=True,
+            description="Wikipedia APIから直接検索・本文取得を常時（デフォルトで絶対）行うか",
+        )
+        WIKIPEDIA_MAX_RESULTS: int = Field(
+            default=2,
+            description="Wikipediaから常時取得する記事の上限数",
+        )
         CRAWL4AI_URL: str = Field(
             default="http://crawl4ai:11235",
             description="CRAWL4AIのベースURL",
@@ -237,7 +249,7 @@ class Tools:
         )
         SEARCH_RESULT_COUNT: int = Field(
             default=8,
-            description="SearXNGから取得する検索結果件数",
+            description="Web検索結果から取得する件数",
         )
         PAGES_TO_FETCH: int = Field(
             default=3,
@@ -454,6 +466,108 @@ class Tools:
                 break
         return results
 
+    def _search_duckduckgo_via_crawl4ai(self, query: str) -> list[dict]:
+        """Crawl4AIのCSS/JSON構造化抽出を使ってDuckDuckGoから直接JSONを取得"""
+        try:
+            ddg_url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
+            _log(f"Crawl4AI経由 DuckDuckGo 検索（JSON抽出モード）開始: {ddg_url}")
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            if self.valves.CRAWL4AI_API_TOKEN:
+                headers["Authorization"] = f"Bearer {self.valves.CRAWL4AI_API_TOKEN}"
+
+            extraction_strategy = {
+                "type": "json_css",
+                "params": {
+                    "schema": {
+                        "name": "DuckDuckGo Search Results",
+                        "baseSelector": ".result",
+                        "fields": [
+                            {"name": "title", "selector": ".result__title", "type": "text"},
+                            {"name": "url", "selector": ".result__a", "type": "attribute", "attribute": "href"},
+                            {"name": "snippet", "selector": ".result__snippet", "type": "text"},
+                        ],
+                    }
+                },
+            }
+
+            payload = {
+                "urls": [ddg_url],
+                "extraction_strategy": extraction_strategy,
+            }
+
+            res = self.session.post(
+                f"{self.valves.CRAWL4AI_URL}/crawl",
+                json=payload,
+                headers=headers,
+                timeout=self.valves.SCRAPE_TIMEOUT,
+            )
+            res.raise_for_status()
+            data = res.json()
+
+            results_data = data.get("results", [data])
+            page_result = results_data[0] if results_data else {}
+
+            extracted_raw = page_result.get("extracted_content")
+            if not extracted_raw:
+                return []
+
+            items = (
+                json.loads(extracted_raw)
+                if isinstance(extracted_raw, str)
+                else extracted_raw
+            )
+
+            results = []
+            seen_urls = set()
+
+            for item in items:
+                title = (item.get("title") or "").strip()
+                raw_url = item.get("url") or ""
+                snippet = (item.get("snippet") or "").strip()
+
+                actual_url = raw_url
+                if "duckduckgo.com/l/?" in raw_url or "uddg=" in raw_url:
+                    parsed = urlparse(raw_url)
+                    qs = parse_qs(parsed.query)
+                    if "uddg" in qs:
+                        actual_url = qs["uddg"][0]
+
+                if (
+                    not actual_url.startswith(("http://", "https://"))
+                    or "duckduckgo.com" in actual_url
+                    or actual_url in seen_urls
+                    or _should_skip_url(actual_url)
+                ):
+                    continue
+
+                title_clean = title.replace("\n", " ").strip()
+                snippet_clean = snippet.replace("\n", " ").strip()
+
+                if not title_clean or len(title_clean) < 2:
+                    continue
+
+                seen_urls.add(actual_url)
+                results.append(
+                    {
+                        "title": title_clean,
+                        "url": actual_url,
+                        "content": snippet_clean or title_clean,
+                    }
+                )
+
+                if len(results) >= self.valves.SEARCH_RESULT_COUNT:
+                    break
+
+            _log(f"Crawl4AI(JSON抽出) DuckDuckGo 取得完了: {len(results)}件")
+            return results
+
+        except Exception as e:
+            _log(f"Crawl4AI経由 DuckDuckGo 検索エラー: {e}")
+            return []
+
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
         title = item.get("title") or item.get("url") or "(タイトルなし)"
         url = item.get("url", "")
@@ -565,8 +679,57 @@ class Tools:
         )
 
         try:
-            search_results = self._search_searxng(query)
-            if not search_results:
+            # 1. SearXNG、Crawl4AI(DDG)、Wikipedia APIを「全て並行」で一元リクエスト
+            searxng_results = []
+            ddg_results = []
+            wiki_pages = []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                future_searxng = executor.submit(self._search_searxng, query)
+
+                future_ddg = (
+                    executor.submit(self._search_duckduckgo_via_crawl4ai, query)
+                    if self.valves.USE_DUCKDUCKGO_BACKUP
+                    else None
+                )
+
+                # デフォルトで絶対取得するWikipedia処理
+                future_wiki = (
+                    executor.submit(self._search_wikipedia_api, query)
+                    if self.valves.ALWAYS_FETCH_WIKIPEDIA
+                    else None
+                )
+
+                searxng_results = future_searxng.result()
+                if future_ddg:
+                    ddg_results = future_ddg.result()
+                if future_wiki:
+                    wiki_pages = future_wiki.result()
+
+            # 2. 一般Web検索の採用（SearXNG優先、全滅時はDDG採用）
+            if searxng_results:
+                search_results = searxng_results
+            elif ddg_results:
+                _log(
+                    f"SearXNGで結果が得られなかったため、Crawl4AI(DuckDuckGo)の結果を採用（{len(ddg_results)}件）"
+                )
+                search_results = ddg_results
+            else:
+                search_results = []
+
+            web_pages = []
+            if search_results:
+                if self.valves.USE_EMBEDDING_RANKING:
+                    selected = self._select_relevant_pages(query, search_results)
+                    web_pages = self._fetch_pages_parallel(selected)
+                else:
+                    top_results = search_results[: self.valves.PAGES_TO_FETCH]
+                    web_pages = self._fetch_pages_parallel(top_results)
+
+            # 3. 確定取得のWikipedia本文ページと、一般Webページを統合
+            all_pages = wiki_pages + web_pages
+
+            if not all_pages:
                 return f"「{query}」に関する検索結果が見つかりませんでした。"
 
             # 4. 出力生成
