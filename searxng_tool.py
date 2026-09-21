@@ -1,8 +1,8 @@
 """
-title: Multi-Search Scraper with Mandatory Wikipedia API Direct Fetch
+title: Multi-Search Scraper with Wikipedia Direct Fetch & Link Browsing
 author: user
-description: SearXNG、Crawl4AI(DDG JSON抽出)、およびWikipedia API直接取得を常時並行実行。ブロックリスクゼロのWikipedia本文を確定で取得・統合する堅牢なWeb検索ツール。
-version: 7.0.0
+description: SearXNG、Crawl4AI(DDG JSON抽出)、Wikipedia APIを並行実行し、AIがread_full_webpageで気になったリンクを追加取得できるWeb検索ツール。
+version: 8.1.0
 """
 
 import concurrent.futures
@@ -28,19 +28,8 @@ def _log(msg: str):
 
 
 _SKIP_EXTENSIONS = (
-    ".pdf",
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".gif",
-    ".webp",
-    ".svg",
-    ".mp4",
-    ".mp3",
-    ".zip",
-    ".rar",
-    ".exe",
-    ".dmg",
+    ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+    ".mp4", ".mp3", ".zip", ".rar", ".exe", ".dmg",
 )
 
 
@@ -49,10 +38,64 @@ def _should_skip_url(url: str) -> bool:
     return path.endswith(_SKIP_EXTENSIONS)
 
 
+# 画像リンク ![alt](URL) はalt込みで丸ごと削除
+_MD_IMAGE_PATTERN = re.compile(r"!\[[^\]]*\]\([^)]*\)")
+# 通常のMarkdownリンク [表示テキスト](URL) は表示テキストだけを残す
+_MD_LINK_PATTERN = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+# Markdownリンク記法に含まれない裸のURLも削除する
+_BARE_URL_PATTERN = re.compile(r"https?://\S+")
+
+
+def _extract_links(markdown: str, max_links: int = 15) -> list[tuple[str, str]]:
+    """
+    Markdown中の [表示テキスト](URL) からリンク一覧を抽出する。
+    本文中のURLは_strip_linksで除去して読みやすくする一方、AIが
+    read_full_webpageツールで「気になったリンクを開く」判断ができるよう、
+    リンクテキストとURLの対応関係だけは別途一覧として保持しておく。
+    """
+    if not markdown:
+        return []
+
+    seen_urls = set()
+    links: list[tuple[str, str]] = []
+
+    for match in _MD_LINK_PATTERN.finditer(markdown):
+        text = match.group(1).strip()
+        full = match.group(0)
+        url_match = re.search(r"\(([^)]*)\)$", full)
+        url = url_match.group(1).strip() if url_match else ""
+
+        if not text or not url or not url.startswith(("http://", "https://")):
+            continue
+        if _should_skip_url(url):
+            continue
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        links.append((text, url))
+        if len(links) >= max_links:
+            break
+
+    return links
+
+
 def _strip_links(markdown: str) -> str:
+    """
+    Markdown中のリンクURLを取り除き、リンクテキストだけを残す。
+    ニュースサイト等は見出しリンクの羅列でURLが大半を占めがちで、
+    文字数上限のほとんどをURL文字列に食われてしまうため、
+    切り詰め処理の前にこれを適用して実際の文章を優先的に残す。
+    """
     if not markdown:
         return markdown
-    text = re.sub(r"[ \t]+", " ", markdown)
+
+    text = _MD_IMAGE_PATTERN.sub("", markdown)
+    text = _MD_LINK_PATTERN.sub(lambda m: m.group(1).strip(), text)
+    text = _BARE_URL_PATTERN.sub("", text)
+
+    text = re.sub(r"^\s*[-*]\s*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n[ \t]+\n", "\n\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -76,6 +119,7 @@ _NUMBERED_LINE_PATTERN = re.compile(
 
 
 def _find_procedure_blocks(text: str) -> list[tuple[int, int]]:
+    """連番の手順（1. 2. 3... / 手順1: / Step 1:）を検出し、割らずに保護する範囲を返す。"""
     lines = text.split("\n")
     line_starts = []
     pos = 0
@@ -104,9 +148,7 @@ def _find_procedure_blocks(text: str) -> list[tuple[int, int]]:
     return blocks
 
 
-def _recursive_split(
-    text: str, chunk_size: int, overlap: int, separators: list[str]
-) -> list[str]:
+def _recursive_split(text: str, chunk_size: int, overlap: int, separators: list[str]) -> list[str]:
     if len(text) <= chunk_size:
         return [text] if text.strip() else []
 
@@ -127,9 +169,7 @@ def _recursive_split(
             if current.strip():
                 chunks.append(current)
             if len(piece) > chunk_size:
-                chunks.extend(
-                    _recursive_split(piece, chunk_size, overlap, rest_separators)
-                )
+                chunks.extend(_recursive_split(piece, chunk_size, overlap, rest_separators))
                 current = ""
             else:
                 current = piece
@@ -151,25 +191,17 @@ def _chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     if not text.strip():
         return []
     separators = [
-        "\n\n",
-        "\n",
-        "。",
-        "！",
-        "？",
-        ". ",
-        "! ",
-        "? ",
-        "、",
-        ", ",
-        " ",
-        "",
+        "\n\n", "\n",
+        "。", "！", "？",
+        ". ", "! ", "? ",
+        "、", ", ",
+        " ", "",
     ]
     return _recursive_split(text, chunk_size, overlap, separators)
 
 
-def _chunk_text_safe(
-    text: str, chunk_size: int, overlap: int, max_procedure_chars: int
-) -> list[str]:
+def _chunk_text_safe(text: str, chunk_size: int, overlap: int, max_procedure_chars: int) -> list[str]:
+    """手順ブロックは割らずに保持しつつ、それ以外は通常のチャンク分割にかける。"""
     if not text.strip():
         return []
 
@@ -185,6 +217,11 @@ def _chunk_text_safe(
             chunks.extend(_chunk_text(before, chunk_size, overlap))
 
         procedure_text = text[start:end]
+        if len(procedure_text) > max_procedure_chars:
+            _log(
+                f"[Chunking] 手順ブロックが上限({max_procedure_chars}文字)を超過"
+                f"（実際{len(procedure_text)}文字）— 安全のため分割せずそのまま1チャンクとして保持します"
+            )
         chunks.append(procedure_text)
         cursor = end
 
@@ -196,8 +233,10 @@ def _chunk_text_safe(
 
 
 class _PageCache:
+    """キャッシュ値は {"text": str, "links": list[tuple[str, str]], "title": str} の辞書。"""
+
     def __init__(self, ttl_seconds: int = 600):
-        self._store: dict[str, tuple[float, str]] = {}
+        self._store: dict[str, tuple[float, dict]] = {}
         self._ttl = ttl_seconds
 
     def get(self, key: str):
@@ -210,7 +249,7 @@ class _PageCache:
             return None
         return value
 
-    def set(self, key: str, value: str):
+    def set(self, key: str, value: dict):
         self._store[key] = (time.time(), value)
 
 
@@ -225,68 +264,68 @@ class Tools:
         )
         USE_DUCKDUCKGO_BACKUP: bool = Field(
             default=True,
-            description="Crawl4AI経由でDuckDuckGo検索も並行取得するか",
+            description="SearXNGが0件だった場合に、Crawl4AI経由でDuckDuckGoを代替として使うか",
         )
         ALWAYS_FETCH_WIKIPEDIA: bool = Field(
             default=True,
-            description="Wikipedia APIから直接検索・本文取得を常時（デフォルトで絶対）行うか",
+            description="Wikipedia APIから直接検索・本文取得を常時行うか",
         )
         WIKIPEDIA_MAX_RESULTS: int = Field(
-            default=2,
-            description="Wikipediaから常時取得する記事の上限数",
+            default=5,
+            description="Wikipediaから取得する記事の上限数",
+        )
+        WIKIPEDIA_MAX_CHARS: int = Field(
+            default=50000,
+            description="Wikipedia1ページあたりの最大文字数（緩め設定）",
         )
         CRAWL4AI_URL: str = Field(
             default="http://crawl4ai:11235",
-            description="CRAWL4AIのベースURL",
+            description="Crawl4AIのベースURL",
         )
         CRAWL4AI_API_TOKEN: str = Field(
             default="your_secret_crawl4ai_token",
-            description="CRAWL4AI_API_TOKEN",
+            description="docker-compose.ymlのCRAWL4AI_API_TOKENと同じ値",
         )
         EMBEDDING_SERVER_URL: str = Field(
             default="http://ruri-embedder:8001",
             description="Ruri v3 embeddingサーバーのベースURL",
         )
         SEARCH_RESULT_COUNT: int = Field(
-            default=8,
+            default=15,
             description="Web検索結果から取得する件数",
         )
         PAGES_TO_FETCH: int = Field(
-            default=3,
+            default=10,
             description="本文取得する上位Webページ数",
         )
         MAX_CHARS_PER_PAGE: int = Field(
             default=20000,
-            description="1ページあたりの文字数上限",
+            description="1Webページあたりの文字数上限（緩め）",
+        )
+        MAX_LINKS_PER_PAGE: int = Field(
+            default=15,
+            description="1ページから提示するリンクの最大件数（read_full_webpageで開く候補）",
         )
         CHUNK_SIZE: int = Field(default=500, description="1チャンクの目安文字数")
-        CHUNK_OVERLAP: int = Field(default=75, description="オーバーラップ文字数")
-        MAX_PROCEDURE_CHARS: int = Field(
-            default=3000, description="手順ブロックの文字数上限目安"
-        )
-        TOP_K_CHUNKS: int = Field(
-            default=8, description="上位いくつかチャンクをLLMに渡すか"
-        )
+        CHUNK_OVERLAP: int = Field(default=75, description="チャンク間オーバーラップ文字数")
+        MAX_PROCEDURE_CHARS: int = Field(default=3000, description="手順ブロックの文字数上限目安")
+        TOP_K_CHUNKS: int = Field(default=10, description="上位いくつのチャンクをLLMに渡すか")
         USE_EMBEDDING_RANKING: bool = Field(
             default=False,
-            description="TrueならEmbeddingを使用（低速・高精度）、Falseなら全文モード（高速）",
+            description="TrueならEmbeddingでページ・チャンク選定（低速・高精度）、Falseなら全文モード（高速）",
         )
-        MAX_WORKERS: int = Field(default=6, description="並行取得上限")
-        CACHE_TTL_SECONDS: int = Field(
-            default=600, description="キャッシュ保持時間（秒）"
-        )
-        SCRAPE_TIMEOUT: int = Field(
-            default=15, description="1ページの取得タイムアウト（秒）"
-        )
+        MAX_WORKERS: int = Field(default=10, description="並行取得の上限数")
+        CACHE_TTL_SECONDS: int = Field(default=600, description="キャッシュ保持時間（秒）")
+        SCRAPE_TIMEOUT: int = Field(default=15, description="1ページの取得タイムアウト（秒）")
         FETCH_TIME_BUDGET_SECONDS: float = Field(
-            default=8.0, description="全ページ取得の全体時間予算（秒）"
+            default=8.0,
+            description="全ページ並行取得にかける全体の時間予算（秒）。超過分は打ち切ってスニペットで代用",
         )
-        MIN_PAGES_REQUIRED: int = Field(default=1, description="最低保証取得ページ数")
-        EMBEDDING_TIMEOUT: int = Field(
-            default=15, description="embeddingのタイムアウト（秒）"
-        )
+        MIN_PAGES_REQUIRED: int = Field(default=1, description="時間予算超過時でも最低限待つページ数")
+        EMBEDDING_TIMEOUT: int = Field(default=15, description="embeddingのタイムアウト（秒）")
 
     def __init__(self):
+        _log("Tools が初期化されました")
         self.valves = self.Valves()
         _page_cache._ttl = self.valves.CACHE_TTL_SECONDS
 
@@ -301,6 +340,14 @@ class Tools:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
+    def debug_ping(self) -> str:
+        """デバッグ用の疎通確認関数。"""
+        _log("debug_ping が呼び出されました")
+        return "pong: Web検索ツールは正しくロードされ、呼び出し可能です。"
+
+    # =========================================================
+    # Embedding（Ruri v3 embeddingサーバー経由・USE_EMBEDDING_RANKING=True時のみ使用）
+    # =========================================================
     def _embed(self, texts: list[str], kind: str = "none") -> list[list[float]]:
         if not texts:
             return []
@@ -312,13 +359,15 @@ class Tools:
             )
             res.raise_for_status()
             data = res.json()
-            return data.get("embeddings", [])
+            embeddings = data.get("embeddings", [])
+            if len(embeddings) != len(texts):
+                _log(f"[Embedding] 件数不一致: 入力{len(texts)}件 / 出力{len(embeddings)}件")
+            return embeddings
         except Exception:
+            _log("[Embedding] 失敗:\n" + traceback.format_exc())
             return [[] for _ in texts]
 
-    def _select_relevant_pages(
-        self, query: str, search_results: list[dict]
-    ) -> list[dict]:
+    def _select_relevant_pages(self, query: str, search_results: list[dict]) -> list[dict]:
         if not search_results:
             return []
         snippets = [r.get("content", "") or r.get("title", "") for r in search_results]
@@ -326,6 +375,7 @@ class Tools:
         snippet_vecs = self._embed(snippets, kind="document")
 
         if not query_vecs or not query_vecs[0]:
+            _log("[ページ選定] embedding失敗のため、検索順位をそのまま使用")
             return search_results[: self.valves.PAGES_TO_FETCH]
 
         query_vec = query_vecs[0]
@@ -336,9 +386,7 @@ class Tools:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for score, item in scored[: self.valves.PAGES_TO_FETCH]]
 
-    def _rank_chunks_by_relevance(
-        self, query: str, chunks_with_meta: list[dict]
-    ) -> list[dict]:
+    def _rank_chunks_by_relevance(self, query: str, chunks_with_meta: list[dict]) -> list[dict]:
         if not chunks_with_meta:
             return []
         query_vecs = self._embed([query], kind="query")
@@ -354,20 +402,18 @@ class Tools:
             for meta, vec in zip(chunks_with_meta, chunk_vecs)
         ]
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [
-            meta for score, meta in scored[: self.valves.TOP_K_CHUNKS] if score > -1.0
-        ]
+        return [meta for score, meta in scored[: self.valves.TOP_K_CHUNKS] if score > -1.0]
 
+    # =========================================================
+    # Wikipedia直接取得
+    # =========================================================
     def _search_wikipedia_api(self, query: str) -> list[dict]:
-        """Wikipedia MediaWiki APIを使ってダイレクト検索し、プレーンテキスト本文を全量取得"""
+        """Wikipedia MediaWiki APIで検索し、プレーンテキスト本文を取得する。"""
         try:
-            _log(f"Wikipedia API 直接取得開始: query='{query}'")
-            headers = {
-                "User-Agent": "MyRAGApp/1.0 (https://example.com; contact@example.com)"
-            }
+            _log(f"[Wikipedia] 直接取得開始: query='{query}'")
+            headers = {"User-Agent": "OpenWebUI-SearchTool/1.0 (self-hosted)"}
             api_url = "https://ja.wikipedia.org/w/api.php"
 
-            # 1. Wikipedia内検索
             search_params = {
                 "action": "query",
                 "list": "search",
@@ -375,20 +421,17 @@ class Tools:
                 "format": "json",
                 "srlimit": self.valves.WIKIPEDIA_MAX_RESULTS,
             }
-            res = self.session.get(
-                api_url, params=search_params, headers=headers, timeout=10
-            )
+            res = self.session.get(api_url, params=search_params, headers=headers, timeout=12)
             res.raise_for_status()
             search_items = res.json().get("query", {}).get("search", [])
 
             if not search_items:
-                _log("Wikipedia API: 該当する記事が見つかりませんでした")
+                _log("[Wikipedia] 該当する記事が見つかりませんでした")
                 return []
 
             titles = [item["title"] for item in search_items]
             titles_str = "|".join(titles)
 
-            # 2. 本文（プレーンテキスト）の一括取得
             fetch_params = {
                 "action": "query",
                 "prop": "extracts",
@@ -397,9 +440,7 @@ class Tools:
                 "format": "json",
                 "redirects": 1,
             }
-            res_pages = self.session.get(
-                api_url, params=fetch_params, headers=headers, timeout=10
-            )
+            res_pages = self.session.get(api_url, params=fetch_params, headers=headers, timeout=15)
             res_pages.raise_for_status()
             pages_data = res_pages.json().get("query", {}).get("pages", {})
 
@@ -412,45 +453,45 @@ class Tools:
                 body_text = page_info.get("extract", "").strip()
 
                 if body_text:
-                    if len(body_text) > self.valves.MAX_CHARS_PER_PAGE:
-                        body_text = (
-                            body_text[: self.valves.MAX_CHARS_PER_PAGE]
-                            + "\n...(以下省略)"
-                        )
+                    if len(body_text) > self.valves.WIKIPEDIA_MAX_CHARS:
+                        body_text = body_text[: self.valves.WIKIPEDIA_MAX_CHARS] + "\n...(以下省略)"
 
                     pages.append(
                         {
                             "title": f"[Wikipedia] {title}",
                             "url": url,
                             "text": body_text,
-                            "source": "wikipedia",
+                            "links": [],  # プレーンテキストのためリンクなし
+                            "is_wikipedia": True,
                         }
                     )
 
-            _log(f"Wikipedia API 直接取得成功: {len(pages)}件")
+            _log(f"[Wikipedia] 取得成功: {len(pages)}件")
             return pages
 
         except Exception as e:
-            _log(f"Wikipedia API 取得エラー: {e}")
+            _log(f"[Wikipedia] 取得エラー: {e}")
             return []
 
+    # =========================================================
+    # 検索（SearXNG / DuckDuckGoフォールバック）
+    # =========================================================
     def _search_searxng_once(self, query: str, attempt: int) -> list[dict]:
         try:
             params = {"q": query, "format": "json", "lang": "ja"}
-            response = self.session.get(
-                self.valves.SEARXNG_URL, params=params, timeout=10
-            )
+            response = self.session.get(self.valves.SEARXNG_URL, params=params, timeout=10)
             response.raise_for_status()
-            return response.json().get("results", [])
-        except Exception:
+            results = response.json().get("results", [])
+            _log(f"[SearXNG] 試行{attempt}: {len(results)}件取得")
+            return results
+        except Exception as e:
+            _log(f"[SearXNG] 試行{attempt}が失敗: {type(e).__name__}: {e}")
             return []
 
     def _search_searxng(self, query: str) -> list[dict]:
+        """SearXNGを2回並行で呼び、結果をマージして重複除去する（一時的なブロック対策）。"""
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            futures = [
-                executor.submit(self._search_searxng_once, query, i + 1)
-                for i in range(2)
-            ]
+            futures = [executor.submit(self._search_searxng_once, query, i + 1) for i in range(2)]
             all_results = []
             for future in concurrent.futures.as_completed(futures):
                 all_results.extend(future.result())
@@ -464,16 +505,21 @@ class Tools:
                 results.append(r)
             if len(results) >= self.valves.SEARCH_RESULT_COUNT:
                 break
+
+        _log(f"[SearXNG] マージ後: {len(results)}件")
         return results
 
     def _search_duckduckgo_via_crawl4ai(self, query: str) -> list[dict]:
-        """Crawl4AIのCSS/JSON構造化抽出を使ってDuckDuckGoから直接JSONを取得"""
+        """SearXNGが0件だった場合のフォールバック。Crawl4AIのCSS抽出でDuckDuckGoから直接取得する。"""
         try:
             ddg_url = f"https://html.duckduckgo.com/html/?q={quote(query)}"
-            _log(f"Crawl4AI経由 DuckDuckGo 検索（JSON抽出モード）開始: {ddg_url}")
+            _log(f"[DuckDuckGo] Crawl4AI経由で取得開始: {ddg_url}")
 
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
             }
             if self.valves.CRAWL4AI_API_TOKEN:
                 headers["Authorization"] = f"Bearer {self.valves.CRAWL4AI_API_TOKEN}"
@@ -493,10 +539,7 @@ class Tools:
                 },
             }
 
-            payload = {
-                "urls": [ddg_url],
-                "extraction_strategy": extraction_strategy,
-            }
+            payload = {"urls": [ddg_url], "extraction_strategy": extraction_strategy}
 
             res = self.session.post(
                 f"{self.valves.CRAWL4AI_URL}/crawl",
@@ -512,13 +555,10 @@ class Tools:
 
             extracted_raw = page_result.get("extracted_content")
             if not extracted_raw:
+                _log("[DuckDuckGo] extracted_contentが空でした")
                 return []
 
-            items = (
-                json.loads(extracted_raw)
-                if isinstance(extracted_raw, str)
-                else extracted_raw
-            )
+            items = json.loads(extracted_raw) if isinstance(extracted_raw, str) else extracted_raw
 
             results = []
             seen_urls = set()
@@ -550,41 +590,47 @@ class Tools:
                     continue
 
                 seen_urls.add(actual_url)
-                results.append(
-                    {
-                        "title": title_clean,
-                        "url": actual_url,
-                        "content": snippet_clean or title_clean,
-                    }
-                )
+                results.append({"title": title_clean, "url": actual_url, "content": snippet_clean or title_clean})
 
                 if len(results) >= self.valves.SEARCH_RESULT_COUNT:
                     break
 
-            _log(f"Crawl4AI(JSON抽出) DuckDuckGo 取得完了: {len(results)}件")
+            _log(f"[DuckDuckGo] 取得完了: {len(results)}件")
             return results
 
         except Exception as e:
-            _log(f"Crawl4AI経由 DuckDuckGo 検索エラー: {e}")
+            _log(f"[DuckDuckGo] 取得エラー: {e}")
             return []
 
+    # =========================================================
+    # 本文取得
+    # =========================================================
     def _fetch_page_via_crawl4ai(self, item: dict) -> dict:
+        """本文とページ内リンク一覧の両方を取得する。"""
         title = item.get("title") or item.get("url") or "(タイトルなし)"
         url = item.get("url", "")
         snippet = item.get("content", "(概要なし)")
 
         if not url or _should_skip_url(url):
-            return {"title": title, "url": url, "text": snippet}
+            return {"title": title, "url": url, "text": snippet, "links": [], "is_wikipedia": False}
 
         cached = _page_cache.get(url)
         if cached is not None:
-            return {"title": title, "url": url, "text": cached}
+            _log(f"[本文取得] キャッシュヒット: {url}")
+            return {
+                "title": cached.get("title", title),
+                "url": url,
+                "text": cached["text"],
+                "links": cached["links"],
+                "is_wikipedia": False,
+            }
 
         headers = {}
         if self.valves.CRAWL4AI_API_TOKEN:
             headers["Authorization"] = f"Bearer {self.valves.CRAWL4AI_API_TOKEN}"
 
         try:
+            _log(f"[本文取得] Crawl4AIへリクエスト: {url}")
             res = self.session.post(
                 f"{self.valves.CRAWL4AI_URL}/crawl",
                 json={"urls": [url]},
@@ -596,42 +642,47 @@ class Tools:
             results = data.get("results", [data])
             page_result = results[0] if results else {}
 
-            meta_title = page_result.get("metadata", {}).get(
-                "title"
-            ) or page_result.get("title")
+            meta_title = page_result.get("metadata", {}).get("title") or page_result.get("title")
             if meta_title and title in (url, "(タイトルなし)"):
                 title = meta_title
 
             markdown = page_result.get("markdown", "")
             if isinstance(markdown, dict):
-                markdown = markdown.get("fit_markdown") or markdown.get(
-                    "raw_markdown", ""
-                )
+                markdown = markdown.get("fit_markdown") or markdown.get("raw_markdown", "")
 
             if not markdown:
-                return {"title": title, "url": url, "text": snippet}
+                _log(f"[本文取得] Markdownが空でした: {url}")
+                return {"title": title, "url": url, "text": snippet, "links": [], "is_wikipedia": False}
 
-            markdown = _strip_links(markdown)
-            if len(markdown) > self.valves.MAX_CHARS_PER_PAGE:
-                markdown = (
-                    markdown[: self.valves.MAX_CHARS_PER_PAGE] + "\n...(以下省略)"
-                )
+            links = _extract_links(markdown, max_links=self.valves.MAX_LINKS_PER_PAGE)
 
-            _page_cache.set(url, markdown)
-            return {"title": title, "url": url, "text": markdown}
-        except Exception:
-            return {"title": title, "url": url, "text": snippet}
+            before_len = len(markdown)
+            cleaned = _strip_links(markdown)
+            _log(f"[本文取得] リンク除去: {before_len}文字 → {len(cleaned)}文字, リンク{len(links)}件抽出")
+
+            if len(cleaned) > self.valves.MAX_CHARS_PER_PAGE:
+                cleaned = cleaned[: self.valves.MAX_CHARS_PER_PAGE] + "\n...(以下省略)"
+
+            _page_cache.set(url, {"text": cleaned, "links": links, "title": title})
+            _log(f"[本文取得] 成功 ({len(cleaned)}文字): {url}")
+            return {"title": title, "url": url, "text": cleaned, "links": links, "is_wikipedia": False}
+
+        except Exception as e:
+            _log(f"[本文取得] スキップ/エラー ({type(e).__name__}): {url}")
+            return {"title": title, "url": url, "text": snippet, "links": [], "is_wikipedia": False}
 
     def _fetch_pages_parallel(self, items: list[dict]) -> list[dict]:
+        """
+        全ページを並行取得するが、FETCH_TIME_BUDGET_SECONDSを過ぎたら
+        遅いリクエストは待たずに切り上げる（レース方式）。
+        """
         worker_count = min(len(items), self.valves.MAX_WORKERS) or 1
+        _log(f"[本文取得] {len(items)}件を並行度{worker_count}で取得開始（時間予算{self.valves.FETCH_TIME_BUDGET_SECONDS}秒）")
+
         pages: list[dict] = []
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=worker_count
-        ) as executor:
-            future_to_item = {
-                executor.submit(self._fetch_page_via_crawl4ai, item): item
-                for item in items
-            }
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            future_to_item = {executor.submit(self._fetch_page_via_crawl4ai, item): item for item in items}
+
             done, not_done = concurrent.futures.wait(
                 future_to_item.keys(),
                 timeout=self.valves.FETCH_TIME_BUDGET_SECONDS,
@@ -641,6 +692,7 @@ class Tools:
                 pages.append(future.result())
 
             if len(pages) < self.valves.MIN_PAGES_REQUIRED and not_done:
+                _log(f"[本文取得] 完了が{len(pages)}件のみのため、MIN_PAGES_REQUIREDまで追加待機")
                 extra_done, not_done = concurrent.futures.wait(
                     not_done, return_when=concurrent.futures.FIRST_COMPLETED
                 )
@@ -648,6 +700,8 @@ class Tools:
                     pages.append(future.result())
 
             if not_done:
+                skipped = [future_to_item[f].get("url", "") for f in not_done]
+                _log(f"[本文取得] 時間予算超過のため{len(not_done)}件を打ち切り: {skipped}")
                 for future in not_done:
                     item = future_to_item[future]
                     future.cancel()
@@ -656,44 +710,84 @@ class Tools:
                             "title": item.get("title", "(タイトルなし)"),
                             "url": item.get("url", ""),
                             "text": item.get("content", "(概要なし)"),
+                            "links": [],
+                            "is_wikipedia": False,
                         }
                     )
+
+        _log(f"[本文取得] 完了: 通常{len(done)}件 / 打ち切り{len(not_done)}件")
         return pages
 
+    # =========================================================
+    # AIが気になったリンクを開くためのツール
+    # =========================================================
+    def read_full_webpage(self, urls: str) -> str:
+        """
+        指定したURLのページを実際に開き、本文全文を取得します。
+        search_webの結果や、ページ内の「主なリンク」一覧に出てきたURLの中から、
+        より詳しく知りたい・裏取りしたいページがあるときに使用してください。
+        複数のURLを一度に開きたい場合は、カンマまたは改行区切りで指定できます。
+
+        :param urls: 開きたいページのURL。1件でも、カンマや改行区切りで複数指定してもよい
+        :return: 各ページの本文と、そのページ内で見つかったリンク一覧
+        """
+        url_list = [u.strip() for u in re.split(r"[,\n]", urls) if u.strip()]
+        _log(f"read_full_webpage が呼び出されました urls={url_list}")
+
+        if not url_list:
+            return "有効なURLが指定されませんでした。"
+
+        items = [{"title": u, "url": u, "content": "(概要なし)"} for u in url_list]
+        pages = self._fetch_pages_parallel(items)
+
+        return "\n".join(self._format_page_with_links(p) for p in pages)
+
+    @staticmethod
+    def _format_page_with_links(p: dict, label: str = "本文") -> str:
+        """ページ本文に加え、ページ内で見つかったリンク一覧を付記する。"""
+        block = f"■ {p['title']}\nURL: {p['url']}\n【{label}】\n{p['text']}\n"
+        links = p.get("links") or []
+        if links:
+            link_lines = "\n".join(f"  - {text} : {href}" for text, href in links)
+            block += f"【このページ内の主なリンク（read_full_webpageで開けます）】\n{link_lines}\n"
+        return block
+
+    # =========================================================
+    # メインエントリーポイント
+    # =========================================================
     def search_web(self, query: str) -> str:
         """
-        指定したキーワードでWeb検索およびWikipedia本文取得を常時実行し、最新・高精度情報を収集します。
+        指定したキーワードでWeb検索およびWikipedia本文取得を実行します。
+        SearXNG・DuckDuckGo(フォールバック)・Wikipediaを並行して調べ、
+        Wikipediaの結果は末尾にまとめて配置します。
+        本文中のURLは読みやすさのため省略されていますが、各ページ末尾の
+        リンク一覧やこの結果自体のURLは read_full_webpage ツールで開けます。
 
         :param query: 検索キーワード
         :return: 検索結果のテキスト
         """
+        start = time.time()
         _log(f"=== search_web 開始: query='{query}' ===")
 
-        ai_instruction_footer = (
+        footer = (
             "\n\n----------------------------------------\n"
-            "【AIへ次のアクション指示】\n"
-            "上記は検索結果の概要/抜粋情報です。\n"
-            "正確な技術仕様・手順・回答の根拠を詳しく把握して信頼性の高い回答を作成するために、"
-            "上記の中から最も有用と思われるページのURLを選び、**必ず `read_full_webpage(urls=\"<対象のURL>\")` ツールを実行して本文全文を取得・精読してください。**\n"
-            "※検索結果の概要のみで推測して回答を作成することは禁止されています。"
+            "【次のアクション】\n"
+            "上記は検索結果の概要・抜粋です。より詳しく知りたい、あるいは裏取りしたい"
+            "ページがあれば、そのURLを read_full_webpage ツールに渡して本文全体を取得してください。"
         )
 
         try:
-            # 1. SearXNG、Crawl4AI(DDG)、Wikipedia APIを「全て並行」で一元リクエスト
-            searxng_results = []
-            ddg_results = []
-            wiki_pages = []
+            searxng_results: list[dict] = []
+            ddg_results: list[dict] = []
+            wiki_pages: list[dict] = []
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                 future_searxng = executor.submit(self._search_searxng, query)
-
                 future_ddg = (
                     executor.submit(self._search_duckduckgo_via_crawl4ai, query)
                     if self.valves.USE_DUCKDUCKGO_BACKUP
                     else None
                 )
-
-                # デフォルトで絶対取得するWikipedia処理
                 future_wiki = (
                     executor.submit(self._search_wikipedia_api, query)
                     if self.valves.ALWAYS_FETCH_WIKIPEDIA
@@ -706,18 +800,15 @@ class Tools:
                 if future_wiki:
                     wiki_pages = future_wiki.result()
 
-            # 2. 一般Web検索の採用（SearXNG優先、全滅時はDDG採用）
             if searxng_results:
                 search_results = searxng_results
             elif ddg_results:
-                _log(
-                    f"SearXNGで結果が得られなかったため、Crawl4AI(DuckDuckGo)の結果を採用（{len(ddg_results)}件）"
-                )
+                _log(f"SearXNGが0件のため、DuckDuckGo(Crawl4AI)の結果を採用（{len(ddg_results)}件）")
                 search_results = ddg_results
             else:
                 search_results = []
 
-            web_pages = []
+            web_pages: list[dict] = []
             if search_results:
                 if self.valves.USE_EMBEDDING_RANKING:
                     selected = self._select_relevant_pages(query, search_results)
@@ -726,63 +817,63 @@ class Tools:
                     top_results = search_results[: self.valves.PAGES_TO_FETCH]
                     web_pages = self._fetch_pages_parallel(top_results)
 
-            # 3. 確定取得のWikipedia本文ページと、一般Webページを統合
-            all_pages = wiki_pages + web_pages
-
-            if not all_pages:
+            if not web_pages and not wiki_pages:
                 return f"「{query}」に関する検索結果が見つかりませんでした。"
 
-            # 4. 出力生成
-            if self.valves.USE_EMBEDDING_RANKING and web_pages:
+            all_pages = web_pages + wiki_pages
+
+            if self.valves.USE_EMBEDDING_RANKING:
                 chunks_with_meta = []
                 for page in all_pages:
                     for chunk in _chunk_text_safe(
-                        page["text"],
-                        self.valves.CHUNK_SIZE,
-                        self.valves.CHUNK_OVERLAP,
-                        self.valves.MAX_PROCEDURE_CHARS,
+                        page["text"], self.valves.CHUNK_SIZE, self.valves.CHUNK_OVERLAP, self.valves.MAX_PROCEDURE_CHARS
                     ):
                         chunks_with_meta.append(
                             {
                                 "text": chunk,
                                 "title": page["title"],
                                 "url": page["url"],
+                                "is_wikipedia": page.get("is_wikipedia", False),
                             }
                         )
 
                 top_chunks = self._rank_chunks_by_relevance(query, chunks_with_meta)
+                links_by_url = {p["url"]: p.get("links") or [] for p in web_pages}
+
                 if not top_chunks:
-                    output_parts = [
-                        f"■ {p['title']}\nURL: {p['url']}\n【内容】\n{p['text'][:800]}\n"
-                        for p in all_pages
-                    ]
+                    web_output = [self._format_page_with_links(p, label="内容") for p in web_pages]
+                    wiki_output = [f"■ {p['title']}\nURL: {p['url']}\n【本文】\n{p['text']}\n" for p in wiki_pages]
+                    output_parts = web_output + wiki_output
                 else:
                     grouped: dict[str, dict] = {}
                     for c in top_chunks:
                         key = c["url"] or c["title"]
                         grouped.setdefault(
                             key,
-                            {"title": c["title"], "url": c["url"], "texts": []},
+                            {"title": c["title"], "url": c["url"], "texts": [], "is_wikipedia": c.get("is_wikipedia", False)},
                         )
                         grouped[key]["texts"].append(c["text"])
 
-                    output_parts = []
+                    web_output, wiki_output = [], []
                     for g in grouped.values():
                         merged_text = "\n…\n".join(g["texts"])
-                        output_parts.append(
-                            f"■ {g['title']}\nURL: {g['url']}\n【関連抜粋】\n{merged_text}\n"
-                        )
-            else:
-                output_parts = [
-                    f"■ {p['title']}\nURL: {p['url']}\n【本文】\n{p['text']}\n"
-                    for p in all_pages
-                ]
+                        block = f"■ {g['title']}\nURL: {g['url']}\n【関連抜粋】\n{merged_text}\n"
+                        links = links_by_url.get(g["url"], [])
+                        if links:
+                            link_lines = "\n".join(f"  - {text} : {href}" for text, href in links)
+                            block += f"【このページ内の主なリンク（read_full_webpageで開けます）】\n{link_lines}\n"
+                        (wiki_output if g["is_wikipedia"] else web_output).append(block)
 
-            return (
-                f"「{query}」のWeb検索・Wikipedia取得結果:\n\n"
-                + "\n".join(output_parts)
-                + ai_instruction_footer
-            )
+                    output_parts = web_output + wiki_output
+            else:
+                web_output = [self._format_page_with_links(p) for p in web_pages]
+                wiki_output = [f"■ {p['title']}\nURL: {p['url']}\n【Wikipedia全文】\n{p['text']}\n" for p in wiki_pages]
+                output_parts = web_output + wiki_output
+
+            output = f"「{query}」のWeb検索・Wikipedia取得結果:\n\n" + "\n".join(output_parts) + footer
+            elapsed = time.time() - start
+            _log(f"=== search_web 正常終了（{elapsed:.1f}秒） ===")
+            return output
 
         except Exception:
             _log("search_web 例外発生:\n" + traceback.format_exc())
