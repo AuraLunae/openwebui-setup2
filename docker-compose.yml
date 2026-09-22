@@ -61,12 +61,10 @@ services:
 
       # ==========================================================
       # Open Terminal（AI用サンドボックス端末）
-      # 接続はGUI（Admin Panel→Settings→Integrations→Terminal）から
-      # 手動で設定する。TERMINAL_SERVER_CONNECTIONSでの自動投入は、
-      # GUIでの変更を毎回上書きしてしまう（PersistentConfigと同様の問題）
-      # ため使わない。URLは http://localhost:8000 を使うこと
-      # （Directory機能がブラウザから直接アクセスするため、コンテナ名
-      # open-terminal ではなく localhost を指定する必要がある）。
+      # `TERMINAL_SERVER_CONNECTIONS` はブラウザが直接参照する
+      # Directory/ファイル一覧機能と相性が悪く、
+      # GUI の Admin → Integrations で設定する方が確実。
+      # URL はブラウザから見える http://localhost:8000 を使う。
       # ==========================================================
 
       # ==========================================================
