@@ -1,12 +1,12 @@
+---
 # ==============================================================
-# Open WebUI + SearXNG + Open Terminal ローカル構築（Windows / RTX 4050 向け）
+# Open WebUI + SearXNG ローカル構築（Windows / RTX 4050 向け）
 #
 # 構成:
 #   - 生成モデル : Qwen3 8B (Ollama経由 / ホストOS側で実行)
 #   - Embedding  : Ruri base (Ollama経由)
 #   - リランカー : 日本語 CrossEncoder (Open WebUI内部で実行)
 #   - Web検索    : SearXNG (同一Composeネットワーク内のコンテナ)
-#   - サンドボックス : Open Terminal (Ubuntu 22.04 + API 一体型コンテナ) 【追加】
 #
 # 事前にホストOS側で実行しておくこと:
 #   ollama pull qwen3:8b
@@ -36,13 +36,6 @@ services:
       OLLAMA_BASE_URL: "http://host.docker.internal:11434"
 
       # ==========================================================
-      # Open Terminal（AI用Ubuntuサンドボックス）の接続設定 【追加】
-      # ==========================================================
-      ENABLE_OPEN_TERMINAL: "true"
-      OPEN_TERMINAL_URL: "http://open-terminal:8000"
-      OPEN_TERMINAL_API_KEY: "your_secret_terminal_key"
-
-      # ==========================================================
       # Web検索の有効化【新名称】
       # ※ 2025年以降のOpen WebUIはこちらを参照する。
       #    旧名称(RAG_接頭辞)だけだと検索処理が起動しないので必須。
@@ -65,6 +58,23 @@ services:
       # --- SearXNGの接続先 ---
       # コンテナ名 searxng で名前解決される（同一Composeネットワーク内）
       SEARXNG_QUERY_URL: "http://searxng:8080/search?lang=ja&q=<query>"
+
+      # ==========================================================
+      # Open Terminal（AI用サンドボックス端末）の接続設定
+      # 公式仕様では ENABLE_OPEN_TERMINAL / OPEN_TERMINAL_URL のような
+      # 個別の環境変数は存在せず、TERMINAL_SERVER_CONNECTIONS という
+      # JSON配列でまとめて指定する（Admin Panel→Settings→Integrationsで
+      # GUIから設定するのと同じ内容を、起動時に自動投入する形）。
+      # ==========================================================
+      TERMINAL_SERVER_CONNECTIONS: >-
+        [{
+          "id": "open-terminal",
+          "name": "Open Terminal",
+          "enabled": true,
+          "url": "http://open-terminal:8000",
+          "key": "your_secret_terminal_key",
+          "auth_type": "bearer"
+        }]
 
       # ==========================================================
       # Embedding（Ruri v3 / Hugging Faceから直接ロード）
@@ -127,21 +137,33 @@ services:
       - searxng
       - crawl4ai
       - ruri-embedder
-      - open-terminal # 【追加】
+      - open-terminal
 
   # ==========================================================
-  # Open Terminal（UbuntuベースのOS + API通信 一体型コンテナ）【追加】
+  # Open Terminal（AI用サンドボックス端末）
+  # :latest（~4GB、Node.js/gcc/ffmpeg/LaTeX/Docker CLI込み）ではなく、
+  # 軽量な :slim（~430MB）を採用。ランタイムでのパッケージ追加はできないが、
+  # 通常のコマンド実行・ファイル操作には十分。重い開発環境が必要になったら
+  # :latest に変更すること。
+  #
+  # 注意: このモードではAIがユーザーアカウントと同等の権限でコマンドを実行できる
+  # （ファイルの変更・削除も含む）。信頼できる用途でのみ有効にすること。
   # ==========================================================
   open-terminal:
     container_name: open_terminal_host
-    image: ghcr.io/open-webui/open-terminal:latest
+    image: ghcr.io/open-webui/open-terminal:slim
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
       - OPEN_TERMINAL_API_KEY=your_secret_terminal_key
     volumes:
-      - open-terminal-workspace:/workspace
+      - open-terminal-home:/home/user
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
 
   # --- ページ本文取得・Markdown抽出（旧Browserlessから移行） ---
   crawl4ai:
@@ -199,4 +221,4 @@ services:
 volumes:
   open-webui:
   ruri-embedder-cache:
-  open-terminal-workspace: # 【追加】
+  open-terminal-home:
