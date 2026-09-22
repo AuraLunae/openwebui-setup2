@@ -60,21 +60,14 @@ services:
       SEARXNG_QUERY_URL: "http://searxng:8080/search?lang=ja&q=<query>"
 
       # ==========================================================
-      # Open Terminal（AI用サンドボックス端末）の接続設定
-      # 公式仕様では ENABLE_OPEN_TERMINAL / OPEN_TERMINAL_URL のような
-      # 個別の環境変数は存在せず、TERMINAL_SERVER_CONNECTIONS という
-      # JSON配列でまとめて指定する（Admin Panel→Settings→Integrationsで
-      # GUIから設定するのと同じ内容を、起動時に自動投入する形）。
+      # Open Terminal（AI用サンドボックス端末）
+      # 接続はGUI（Admin Panel→Settings→Integrations→Terminal）から
+      # 手動で設定する。TERMINAL_SERVER_CONNECTIONSでの自動投入は、
+      # GUIでの変更を毎回上書きしてしまう（PersistentConfigと同様の問題）
+      # ため使わない。URLは http://localhost:8000 を使うこと
+      # （Directory機能がブラウザから直接アクセスするため、コンテナ名
+      # open-terminal ではなく localhost を指定する必要がある）。
       # ==========================================================
-      TERMINAL_SERVER_CONNECTIONS: >-
-        [{
-          "id": "open-terminal",
-          "name": "Open Terminal",
-          "enabled": true,
-          "url": "http://open-terminal:8000",
-          "key": "your_secret_terminal_key",
-          "auth_type": "bearer"
-        }]
 
       # ==========================================================
       # Embedding（Ruri v3 / Hugging Faceから直接ロード）
