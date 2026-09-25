@@ -1,8 +1,8 @@
 """
-title: Multi-Search Scraper with Wikipedia Direct Fetch & Link Browsing
+title: SearXNG Web Search
 author: user
 description: SearXNG、Crawl4AI(DDG JSON抽出)、Wikipedia APIを並行実行し、AIがread_full_webpageで気になったリンクを追加取得できるWeb検索ツール。
-version: 8.1.0
+version: 8.2.0
 """
 
 import concurrent.futures
@@ -339,11 +339,6 @@ class Tools:
         adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-
-    def debug_ping(self) -> str:
-        """デバッグ用の疎通確認関数。"""
-        _log("debug_ping が呼び出されました")
-        return "pong: Web検索ツールは正しくロードされ、呼び出し可能です。"
 
     # =========================================================
     # Embedding（Ruri v3 embeddingサーバー経由・USE_EMBEDDING_RANKING=True時のみ使用）
@@ -878,3 +873,4 @@ class Tools:
         except Exception:
             _log("search_web 例外発生:\n" + traceback.format_exc())
             return "検索処理中にエラーが発生しました。"
+
